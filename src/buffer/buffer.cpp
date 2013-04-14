@@ -69,7 +69,12 @@ namespace Buffer {
       usr->S.SendNow(thisStream->getHeader());
     }
     Stream::get()->dropReadLock();
-
+    //Added by Valur Hrafn for sending the last metapack to new streams
+    Stream::get()->getReadLock();
+    if (thisStream->getStream()->lastmetapack){
+      usr->S.SendNow(thisStream->getStream()->lastmetapack.toNetPacked());
+    }
+    Stream::get()->dropReadLock();
     while (usr->S.connected()){
       usleep(5000); //sleep 5ms
       if ( !usr->myRing->playCount || !usr->Send()){
