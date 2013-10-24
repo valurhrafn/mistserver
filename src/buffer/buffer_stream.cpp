@@ -32,7 +32,7 @@ namespace Buffer {
 
   ///\brief Do cleanup on delete.
   Stream::~Stream(){
-    tthread::lock_guard<tthread::mutex> guard(stats_mutex);
+    tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     if (users.size() > 0){
       for (usersIt = users.begin(); usersIt != users.end(); usersIt++){
         if (( * *usersIt).S.connected()){
@@ -50,7 +50,7 @@ namespace Buffer {
     static std::string ret;
     long long int now = Util::epoch();
     unsigned int tot_up = 0, tot_down = 0, tot_count = 0;
-    tthread::lock_guard<tthread::mutex> guard(stats_mutex);
+    tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     if (users.size() > 0){
       for (usersIt = users.begin(); usersIt != users.end(); usersIt++){
         tot_down += ( * *usersIt).curr_down;
@@ -63,12 +63,17 @@ namespace Buffer {
     Storage["totals"]["count"] = tot_count;
     Storage["totals"]["now"] = now;
     Storage["buffer"] = name;
+
     Storage["meta"] = Strm->metadata;
-    if (Storage["meta"].isMember("audio")){
-      Storage["meta"]["audio"].removeMember("init");
-    }
-    if (Storage["meta"].isMember("video")){
-      Storage["meta"]["video"].removeMember("init");
+
+    if(Storage["meta"].isMember("tracks") && Storage["meta"]["tracks"].size() > 0){
+      for(JSON::ObjIter it = Storage["meta"]["tracks"].ObjBegin(); it != Storage["meta"]["tracks"].ObjEnd(); it++){
+        it->second.removeMember("init");
+        it->second.removeMember("keys");
+        it->second.removeMember("frags");
+      }
+      //delete empty trackname if present - these are never interesting
+      Storage["meta"]["tracks"].removeMember("");
     }
     ret = Storage.toString();
     Storage["log"].null();
@@ -133,7 +138,7 @@ namespace Buffer {
   ///\param username The name of the user.
   ///\param stats The final statistics to store.
   void Stream::saveStats(std::string username, Stats & stats){
-    tthread::lock_guard<tthread::mutex> guard(stats_mutex);
+    tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     Storage["curr"][username]["connector"] = stats.connector;
     Storage["curr"][username]["up"] = stats.up;
     Storage["curr"][username]["down"] = stats.down;
@@ -147,7 +152,7 @@ namespace Buffer {
   ///\param stats The final statistics to store.
   ///\param reason The reason for disconnecting.
   void Stream::clearStats(std::string username, Stats & stats, std::string reason){
-    tthread::lock_guard<tthread::mutex> guard(stats_mutex);
+    tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     if (Storage["curr"].isMember(username)){
       Storage["curr"].removeMember(username);
   #if DEBUG >= 4
@@ -179,11 +184,7 @@ namespace Buffer {
   ///\param newPacketsAvailable Whether new packets are available to update the index.
   void Stream::dropWriteLock(bool newPacketsAvailable){
     if (newPacketsAvailable){
-      if (Strm->getPacket(0).isMember("keyframe")){
-        stats_mutex.lock();
-        Strm->updateHeaders();
-        stats_mutex.unlock();
-      }
+      Strm->metadata.netPrepare();
     }
     rw_mutex.lock();
     writers--;
@@ -229,20 +230,28 @@ namespace Buffer {
   ///\brief Add a user to the userlist.
   ///\param newUser The user to be added.
   void Stream::addUser(user * newUser){
-    tthread::lock_guard<tthread::mutex> guard(stats_mutex);
+    tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     users.insert(newUser);
   }
 
-  ///\brief Add a user to the userlist.
-  ///\param newUser The user to be added.
+  ///\brief Removes a user to the userlist.
+  ///\param newUser The user to be removed.
   void Stream::removeUser(user * oldUser){
-    tthread::lock_guard<tthread::mutex> guard(stats_mutex);
+    tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     users.erase(oldUser);
+  }
+
+  ///\brief Disconnects all users.
+  void Stream::disconnectUsers(){
+    tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
+    for (usersIt = users.begin(); usersIt != users.end(); usersIt++){
+      (*usersIt)->Disconnect("Stream reset");
+    }
   }
   
   ///\brief Blocks the thread until new data is available.
   void Stream::waitForData(){
-    tthread::lock_guard<tthread::mutex> guard(stats_mutex);
+    tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     moreData.wait(stats_mutex);
   }
 }

@@ -120,6 +120,7 @@ button
    color: #fff;
    border: 0;
    margin: 0 2px 0 2px;
+   cursor: pointer;
 }
 
 
@@ -235,6 +236,9 @@ li#logoutbutton
 {
    color: #cc3333;
 }
+#nav li a {
+   color: inherit;
+}
 
 
 p, label
@@ -295,6 +299,7 @@ thead th .theadinfo
 th,
 #login > button,
 p,
+span,
 label,
 button,
 #page label input,
@@ -308,10 +313,15 @@ button,
    text-transform: uppercase;
 }
 
+span {
+   font-weight: normal;
+   text-transform: none ;
+}
+
 
 .nocapitals
 {
-   text-transform: none ;
+   text-transform: none !important;
 }
 
 #editserver label input
@@ -445,4 +455,14 @@ td
 	opacity: 0.8;
 	color: black;
 	font: normal normal 11pt Arial, sans-serif;
+}
+.comment {
+  font-size: 0.8em;
+}
+
+code
+{
+  font-size: 0.9em;
+  padding: 0 0 0 5px;
+  color: #666;
 }

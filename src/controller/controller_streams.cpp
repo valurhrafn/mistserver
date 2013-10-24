@@ -1,6 +1,8 @@
 #include <mist/procs.h>
 #include <mist/config.h>
 #include <mist/timing.h>
+#include <mist/stream.h>
+#include <mist/dtsc.h>
 #include "controller_streams.h"
 #include "controller_storage.h"
 #include <sys/stat.h>
@@ -59,9 +61,28 @@ namespace Controller {
           data["online"] = 0;
           return;
         }
-        cmd1 = "cat " + URL;
-        data["error"] = "Available";
-        data["online"] = 2;
+        if ( !data.isMember("meta") || !data["meta"].isMember("tracks")){
+          char * tmp_cmd[3] = {0, 0, 0};
+          std::string mistinfo = Util::getMyPath() + "MistInfo";
+          tmp_cmd[0] = (char*)mistinfo.c_str();
+          tmp_cmd[1] = (char*)URL.c_str();
+          data["meta"] = JSON::fromString(Util::Procs::getOutputOf(tmp_cmd));
+        }
+        if ( !DTSC::isFixed(data["meta"])){
+          char * tmp_cmd[3] = {0, 0, 0};
+          std::string mistfix = Util::getMyPath() + "MistDTSCFix";
+          tmp_cmd[0] = (char*)mistfix.c_str();
+          tmp_cmd[1] = (char*)URL.c_str();
+          Util::Procs::getOutputOf(tmp_cmd);
+          data.removeMember("meta");
+        }
+        if (Util::epoch() - lastBuffer[name] > 5){
+          data["error"] = "Available";
+          data["online"] = 2;
+        }else{
+          data["online"] = 1;
+          data.removeMember("error");
+        }
         return; //MistPlayer handles VoD
       }else{
         cmd1 = "ffmpeg -re -async 2 -i " + URL + " -f flv -";
@@ -136,7 +157,7 @@ namespace Controller {
       changed = true;
     }
     if (changed){
-      WriteFile("/tmp/mist/streamlist", strlist.toString());
+      WriteFile(Util::getTmpFolder() + "streamlist", strlist.toString());
     }
   }
 

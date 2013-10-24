@@ -51,6 +51,8 @@ namespace Buffer {
       void addUser(user * newUser);
       /// Delete a user from the userlist.
       void removeUser(user * oldUser);
+      /// Disconnects all users.
+      void disconnectUsers();
       /// Blocks the thread until new data is available.
       void waitForData();
       /// Cleanup function
@@ -66,7 +68,7 @@ namespace Buffer {
       DTSC::Stream * Strm;
       std::string waiting_ip; ///< IP address for media push.
       Socket::Connection ip_input; ///< Connection used for media push.
-      tthread::mutex stats_mutex; ///< Mutex for stats/users modifications.
+      tthread::recursive_mutex stats_mutex; ///< Mutex for stats/users modifications.
       std::set<user*> users; ///< All connected users.
       std::set<user*>::iterator usersIt; ///< Iterator for all connected users.
       std::string name; ///< Name for this buffer.

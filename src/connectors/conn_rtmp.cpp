@@ -29,6 +29,7 @@ namespace Connector_RTMP {
   bool inited = false; ///< Indicates whether we are ready to connect to the Buffer.
   bool noStats = false; ///< Indicates when no stats should be sent anymore. Used in push mode.
   bool stopParsing = false; ///< Indicates when to stop all parsing.
+  bool streamReset = false;
 
   //for reply to play command
   int playTransaction = -1;///<The transaction number of the reply.
@@ -37,7 +38,9 @@ namespace Connector_RTMP {
 
   //generic state keeping
   bool streamInited = false;///<Indicates whether init data for audio/video was sent.
-  
+  int videoID = -1;
+  int audioID = -1;
+
   Socket::Connection Socket; ///< A copy of the user socket to allow helper functions to directly send data.
   Socket::Connection ss; ///< Socket connected to server.
   std::string streamName; ///< Stream that will be opened.
@@ -192,6 +195,7 @@ namespace Connector_RTMP {
         ss.Send("P ");
         ss.Send(Socket.getHost().c_str());
         ss.Send("\n");
+        streamReset = true;
         noStats = true;
       }
       //send a _result reply
@@ -411,6 +415,14 @@ namespace Connector_RTMP {
         case 9: //video data
         case 18: //meta data
           if (ss.connected()){
+            if (streamReset){
+              //reset push data to empty, in case stream properties change
+              meta_out.null();
+              prebuffer.str("");
+              sending = false;
+              counter = 0;
+              streamReset = false;
+            }
             F.ChunkLoader(next);
             JSON::Value pack_out = F.toJSON(meta_out);
             if ( !pack_out.isNull()){
@@ -547,7 +559,27 @@ namespace Connector_RTMP {
             break;
           }
           ss.setBlocking(false);
-          ss.SendNow("p\n");
+          Strm.waitForMeta(ss);
+          //find first audio and video tracks
+          for (JSON::ObjIter objIt = Strm.metadata["tracks"].ObjBegin(); objIt != Strm.metadata["tracks"].ObjEnd(); objIt++){
+            if (videoID == -1 && objIt->second["type"].asStringRef() == "video"){
+              videoID = objIt->second["trackid"].asInt();
+            }
+            if (audioID == -1 && objIt->second["type"].asStringRef() == "audio"){
+              audioID = objIt->second["trackid"].asInt();
+            }
+          }
+          //select the tracks and play
+          std::stringstream cmd;
+          cmd << "t";
+          if (videoID != -1){
+            cmd << " " << videoID;
+          }
+          if (audioID != -1){
+            cmd << " " << audioID;
+          }
+          cmd << "\np\n";
+          ss.SendNow(cmd.str().c_str());
           inited = true;
         }
         if (inited && !noStats){
@@ -599,14 +631,14 @@ namespace Connector_RTMP {
 
             //sent init data if needed
             if ( !streamInited){
-              init_tag.DTSCMetaInit(Strm);
+              init_tag.DTSCMetaInit(Strm, Strm.getTrackById(videoID), Strm.getTrackById(audioID));
               Socket.SendNow(RTMPStream::SendMedia(init_tag));
-              if (Strm.metadata.isMember("audio") && Strm.metadata["audio"].isMember("init")){
-                init_tag.DTSCAudioInit(Strm);
+              if (audioID != -1 && Strm.getTrackById(audioID).isMember("init")){
+                init_tag.DTSCAudioInit(Strm.getTrackById(audioID));
                 Socket.SendNow(RTMPStream::SendMedia(init_tag));
               }
-              if (Strm.metadata.isMember("video") && Strm.metadata["video"].isMember("init")){
-                init_tag.DTSCVideoInit(Strm);
+              if (videoID != -1 && Strm.getTrackById(videoID).isMember("init")){
+                init_tag.DTSCVideoInit(Strm.getTrackById(videoID));
                 Socket.SendNow(RTMPStream::SendMedia(init_tag));
               }
               streamInited = true;
@@ -631,8 +663,25 @@ namespace Connector_RTMP {
 ///\brief The standard process-spawning main function.
 int main(int argc, char ** argv){
   Util::Config conf(argv[0], PACKAGE_VERSION);
-  conf.addConnectorOptions(1935);
+  JSON::Value capa;
+  capa["desc"] = "Enables the RTMP protocol which is used by Adobe Flash Player.";
+  capa["deps"] = "";
+  capa["url_rel"] = "/play/$";
+  capa["codecs"][0u][0u].append("H264");
+  capa["codecs"][0u][0u].append("H263");
+  capa["codecs"][0u][0u].append("VP6");
+  capa["codecs"][0u][1u].append("AAC");
+  capa["codecs"][0u][1u].append("MP3");
+  capa["methods"][0u]["handler"] = "rtmp";
+  capa["methods"][0u]["type"] = "flash/10";
+  capa["methods"][0u]["priority"] = 6ll;
+  conf.addConnectorOptions(1935, capa);
   conf.parseArgs(argc, argv);
+  if (conf.getBool("json")){
+    std::cout << capa.toString() << std::endl;
+    return -1;
+  }
+  
   Socket::Server server_socket = Socket::Server(conf.getInteger("listen_port"), conf.getString("listen_interface"));
   if ( !server_socket.connected()){
     return 1;

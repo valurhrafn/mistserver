@@ -4,6 +4,7 @@
 #include <iostream>
 #include <queue>
 #include <sstream>
+#include <iomanip>
 
 #include <cstdlib>
 #include <cstdio>
@@ -27,22 +28,20 @@ namespace Connector_HTTP {
   ///\brief Main function for the HTTP Progressive Connector
   ///\param conn A socket describing the connection the client.
   ///\return The exit code of the connector.
-  int progressiveConnector(Socket::Connection conn){
+  int JSONConnector(Socket::Connection conn){
     bool progressive_has_sent_header = false;//Indicates whether we have sent a header.
-    bool ready4data = false; //Set to true when streaming is to begin.
     DTSC::Stream Strm; //Incoming stream buffer.
     HTTP::Parser HTTP_R, HTTP_S;//HTTP Receiver en HTTP Sender.
     bool inited = false;//Whether the stream is initialized
     Socket::Connection ss( -1);//The Stream Socket, used to connect to the desired stream.
     std::string streamname;//Will contain the name of the stream.
-    FLV::Tag tag;//Temporary tag buffer.
 
     unsigned int lastStats = 0;//Indicates the last time that we have sent stats to the server socket.
     unsigned int seek_sec = 0;//Seek position in ms
     unsigned int seek_byte = 0;//Seek position in bytes
-    
-    bool isMP3 = false;//Indicates whether the request is audio-only mp3.
-
+            
+   std::stringstream jsondata;
+       
     while (conn.connected()){
       //Only attempt to parse input when not yet init'ed.
       if ( !inited){
@@ -62,15 +61,8 @@ namespace Connector_HTTP {
             std::cout << "Received request: " << HTTP_R.getUrl() << std::endl;
 #endif
             conn.setHost(HTTP_R.GetHeader("X-Origin"));
-            //we assume the URL is the stream name with a 3 letter extension
-            streamname = HTTP_R.getUrl().substr(1);
-            size_t extDot = streamname.rfind('.');
-            if (extDot != std::string::npos){
-              if (streamname.substr(extDot + 1) == "mp3"){
-                isMP3 = true;
-              }
-              streamname.resize(extDot);
-            }; //strip the extension
+            streamname = HTTP_R.GetHeader("X-Stream");
+
             int start = 0;
             if ( !HTTP_R.GetVar("start").empty()){
               start = atoi(HTTP_R.GetVar("start").c_str());
@@ -89,99 +81,95 @@ namespace Connector_HTTP {
             }
             //under 3 hours we assume seconds, otherwise byte position
             if (start < 10800){
-              seek_sec = start * 1000; //ms, not s
+              seek_byte = start * 1000; //ms, not s
             }else{
-              seek_byte = start; //divide by 1mbit, then *1000 for ms.
+              seek_byte = start * 1000; //divide by 1mbit, then *1000 for ms.
             }
-            ready4data = true;
+           // ready4data = true;
             HTTP_R.Clean(); //clean for any possible next requests
-          }
-        }
-      }
-      if (ready4data){
-        if ( !inited){
-          //we are ready, connect the socket!
-          ss = Util::Stream::getStream(streamname);
-          if ( !ss.connected()){
-#if DEBUG >= 1
-            fprintf(stderr, "Could not connect to server for %s!\n", streamname.c_str());
-#endif
-            ss.close();
-            HTTP_S.Clean();
-            HTTP_S.SetBody("No such stream is available on the system. Please try again.\n");
-            conn.SendNow(HTTP_S.BuildResponse("404", "Not found"));
-            ready4data = false;
-            continue;
-          }
-          if (seek_byte){
+            jsondata.clear();
+            jsondata << "[";
+
+            //we are ready, connect the socket!
+            if ( !ss.connected()){
+              ss = Util::Stream::getStream(streamname);
+            }
+            if ( !ss.connected()){
+  #if DEBUG >= 1
+              fprintf(stderr, "Could not connect to server for %s!\n", streamname.c_str());
+  #endif
+              ss.close();
+              HTTP_S.Clean();
+              HTTP_S.SetBody("No such stream is available on the system. Please try again.\n");
+              conn.SendNow(HTTP_S.BuildResponse("404", "Not found"));
+              //ready4data = false;
+              inited = false;
+              continue;
+            }
+            
             //wait until we have a header
-            while ( !Strm.metadata){
+            while ( !Strm.metadata && ss.connected()){
               if (ss.spool()){
                 Strm.parsePacket(ss.Received()); //read the metadata
               }else{
                 Util::sleep(5);
               }
             }
-            int byterate = 0;
-            if (Strm.metadata.isMember("video") && !isMP3){
-              byterate += Strm.metadata["video"]["bps"].asInt();
-            }
-            if (Strm.metadata.isMember("audio")){
-              byterate += Strm.metadata["audio"]["bps"].asInt();
-            }
-            seek_sec = (seek_byte / byterate) * 1000;
-          }
-          if (seek_sec){
+
+            seek_sec = seek_byte;
+           
             std::stringstream cmd;
-            cmd << "s " << seek_sec << "\n";
-            ss.SendNow(cmd.str().c_str());
+            cmd << "t";
+
+            if (Strm.metadata["tracks"].size()){
+              for (JSON::ObjIter objIt = Strm.metadata["tracks"].ObjBegin(); objIt != Strm.metadata["tracks"].ObjEnd(); objIt++){
+                if ( objIt->second["type"].asStringRef() == "meta" ){
+                  cmd << " " <<  objIt->second["trackid"].asInt();
+                }
+              }        
+            }
+
+            if( cmd.str() == "t" ){
+              cmd.str("");
+              cmd.clear();
+            }
+
+            int maxTime = Strm.metadata["lastms"].asInt();
+            
+            cmd << "\ns " << seek_sec << "\np " << maxTime << "\n";
+            ss.SendNow(cmd.str().c_str(), cmd.str().size());
+            inited = true;
+          
           }
-          ss.SendNow("p\n");
-          inited = true;
         }
-        unsigned int now = Util::epoch();
+      }
+      if (inited){
+
+      unsigned int now = Util::epoch();
         if (now != lastStats){
           lastStats = now;
-          ss.SendNow(conn.getStats("HTTP_Progressive").c_str());
+          ss.SendNow(conn.getStats("HTTP_JSON").c_str());
         }
+        
         if (ss.spool()){
           while (Strm.parsePacket(ss.Received())){
-            if ( !progressive_has_sent_header){
+            if(Strm.lastType() == DTSC::PAUSEMARK){
               HTTP_S.Clean(); //make sure no parts of old requests are left in any buffers
-              if (!isMP3){
-                HTTP_S.SetHeader("Content-Type", "video/x-flv"); //Send the correct content-type for FLV files
-              }else{
-                HTTP_S.SetHeader("Content-Type", "audio/mpeg"); //Send the correct content-type for MP3 files
-              }
-              //HTTP_S.SetHeader("Transfer-Encoding", "chunked");
-              HTTP_S.protocol = "HTTP/1.0";
+              HTTP_S.SetHeader("Content-Type", "application/json"); //Send the correct content-type for FLV files
+              jsondata << "]";
+              HTTP_S.SetBody(jsondata.str());
               conn.SendNow(HTTP_S.BuildResponse("200", "OK")); //no SetBody = unknown length - this is intentional, we will stream the entire file
-              if ( !isMP3){
-                conn.SendNow(FLV::Header, 13); //write FLV header
-                //write metadata
-                tag.DTSCMetaInit(Strm);
-                conn.SendNow(tag.data, tag.len);
-                //write video init data, if needed
-                if (Strm.metadata.isMember("video") && Strm.metadata["video"].isMember("init")){
-                  tag.DTSCVideoInit(Strm);
-                  conn.SendNow(tag.data, tag.len);
-                }
-                //write audio init data, if needed
-                if (Strm.metadata.isMember("audio") && Strm.metadata["audio"].isMember("init")){
-                  tag.DTSCAudioInit(Strm);
-                  conn.SendNow(tag.data, tag.len);
-                }
-              }
-              progressive_has_sent_header = true;
+              inited = false;
+              jsondata.str(""); // totally do this
+              jsondata.clear();
+              break;
             }
-            if ( !isMP3){
-              tag.DTSCLoader(Strm);
-              conn.SendNow(tag.data, tag.len); //write the tag contents
-            }else{
-              if(Strm.lastType() == DTSC::AUDIO){
-                conn.SendNow(Strm.lastData()); //write the MP3 contents
-              }
+              
+            if (jsondata.str().length() > 1){
+              jsondata << ",";
             }
+            
+            jsondata << Strm.getPacket().toString();
           }
         }else{
           Util::sleep(1);
@@ -190,21 +178,36 @@ namespace Connector_HTTP {
           break;
         }
       }
+     
     }
     conn.close();
-    ss.SendNow(conn.getStats("HTTP_Dynamic").c_str());
+    ss.SendNow(conn.getStats("HTTP_JSON").c_str());
     ss.close();
     return 0;
-  } //Progressive_Connector main function
+  } //SRT main function
 
 } //Connector_HTTP namespace
 
 ///\brief The standard process-spawning main function.
 int main(int argc, char ** argv){
   Util::Config conf(argv[0], PACKAGE_VERSION);
-  conf.addConnectorOptions(1935);
+  JSON::Value capa;
+  capa["desc"] = "Enables HTTP protocol JSON streaming.";
+  capa["deps"] = "HTTP";
+  capa["url_rel"] = "/$.json";
+  capa["url_match"] = "/$.json";
+  capa["url_handler"] = "http";
+  capa["url_type"] = "json";
+  capa["socket"] = "http_json";
+  conf.addBasicConnectorOptions(capa);
   conf.parseArgs(argc, argv);
-  Socket::Server server_socket = Socket::Server("/tmp/mist/http_progressive");
+  
+  if (conf.getBool("json")){
+    std::cout << capa.toString() << std::endl;
+    return -1;
+  }
+  
+  Socket::Server server_socket = Socket::Server(Util::getTmpFolder() + capa["socket"].asStringRef());
   if ( !server_socket.connected()){
     return 1;
   }
@@ -215,7 +218,7 @@ int main(int argc, char ** argv){
     if (S.connected()){ //check if the new connection is valid
       pid_t myid = fork();
       if (myid == 0){ //if new child, start MAINHANDLER
-        return Connector_HTTP::progressiveConnector(S);
+        return Connector_HTTP::JSONConnector(S);
       }else{ //otherwise, do nothing or output debugging text
 #if DEBUG >= 5
         fprintf(stderr, "Spawned new process %i for socket %i\n", (int)myid, S.getSocket());

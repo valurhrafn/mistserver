@@ -28,52 +28,80 @@ namespace Connector_HTTP {
   ///\brief Builds an index file for HTTP Live streaming.
   ///\param metadata The current metadata, used to generate the index.
   ///\return The index file for HTTP Live Streaming.
-  std::string liveIndex(JSON::Value & metadata){
-    std::stringstream Result;
-    if ( !metadata.isMember("live")){
+  std::string liveIndex(JSON::Value & metadata, bool isLive){
+    std::stringstream result;
+    if (metadata.isMember("tracks")){
+      result << "#EXTM3U\r\n";
+      int audioId = -1;
+      std::string audioName;
+      bool defAudio = false;//set default audio track;
+      for (JSON::ObjIter trackIt = metadata["tracks"].ObjBegin(); trackIt != metadata["tracks"].ObjEnd(); trackIt++){
+        if (trackIt->second["type"].asStringRef() == "audio"){
+          audioId = trackIt->second["trackid"].asInt();
+          audioName = trackIt->first;
+          break;
+        }
+      }
+      for (JSON::ObjIter trackIt = metadata["tracks"].ObjBegin(); trackIt != metadata["tracks"].ObjEnd(); trackIt++){
+        if (trackIt->second["type"].asStringRef() == "video"){
+          int bWidth = trackIt->second["maxbps"].asInt();
+          if (audioId != -1){
+            bWidth += (metadata["tracks"][audioName]["maxbps"].asInt() * 2);
+          }
+          result << "#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=" << bWidth * 10 << "\r\n";
+          result << trackIt->second["trackid"].asInt();
+          if (audioId != -1){
+            result << "_" << audioId;
+          }
+          result << "/index.m3u8\r\n";
+        }
+      }
+    }else{
+      //parse single track
       int longestFragment = 0;
       for (JSON::ArrIter ai = metadata["frags"].ArrBegin(); ai != metadata["frags"].ArrEnd(); ai++){
         if ((*ai)["dur"].asInt() > longestFragment){
           longestFragment = (*ai)["dur"].asInt();
         }
       }
-      Result << "#EXTM3U\r\n"
+      result << "#EXTM3U\r\n"
           "#EXT-X-TARGETDURATION:" << (longestFragment / 1000) + 1 << "\r\n"
-          "#EXT-X-MEDIA-SEQUENCE:0\r\n";
+          "#EXT-X-MEDIA-SEQUENCE:" << metadata["missed_frags"].asInt() << "\r\n";
       for (JSON::ArrIter ai = metadata["frags"].ArrBegin(); ai != metadata["frags"].ArrEnd(); ai++){
-        Result << "#EXTINF:" << (*ai)["dur"].asInt() / 1000 << ", no desc\r\n" << (*ai)["num"].asInt() << "_" << (*ai)["len"].asInt() << ".ts\r\n";
+        long long int starttime = 0;
+        JSON::ArrIter fi = metadata["keys"].ArrBegin();
+        while (fi != metadata["keys"].ArrEnd() && (*fi)["num"].asInt() < (*ai)["num"].asInt()){
+          fi++;
+        }
+        if (fi != metadata["keys"].ArrEnd()){
+          starttime = (*fi)["time"].asInt();
+        }
+        
+        result << "#EXTINF:" << (((*ai)["dur"].asInt() + 500) / 1000) << ", no desc\r\n"
+            << starttime << "_" << (*ai)["dur"].asInt() + starttime << ".ts\r\n";
       }
-      Result << "#EXT-X-ENDLIST";
-    }else{
-      if (metadata["missed_frags"].asInt() < 0){
-        metadata["missed_frags"] = 0ll;
-      }
-      Result << "#EXTM3U\r\n"
-          "#EXT-X-MEDIA-SEQUENCE:" << metadata["missed_frags"].asInt() <<"\r\n"
-          "#EXT-X-TARGETDURATION:30\r\n";
-      for (JSON::ArrIter ai = metadata["frags"].ArrBegin(); ai != metadata["frags"].ArrEnd(); ai++){
-        Result << "#EXTINF:" << (*ai)["dur"].asInt() / 1000 << ", no desc\r\n" << (*ai)["num"].asInt() << "_" << (*ai)["len"].asInt() << ".ts\r\n";
+      if ( !isLive){
+        result << "#EXT-X-ENDLIST\r\n";
       }
     }
 #if DEBUG >= 8
     std::cerr << "Sending this index:" << std::endl << Result.str() << std::endl;
 #endif
-    return Result.str();
+    return result.str();
   } //liveIndex
 
   ///\brief Main function for the HTTP Live Connector
   ///\param conn A socket describing the connection the client.
   ///\return The exit code of the connector.
   int liveConnector(Socket::Connection conn){
-    std::stringstream TSBuf;
-    long long int TSBufTime = 0;
-
     DTSC::Stream Strm; //Incoming stream buffer.
     HTTP::Parser HTTP_R, HTTP_S; //HTTP Receiver en HTTP Sender.
 
     bool ready4data = false; //Set to true when streaming is to begin.
+    bool AppleCompat = false; //Set to true when Apple device detected.
     Socket::Connection ss( -1);
     std::string streamname;
+    bool handlingRequest = false;
     std::string recBuffer = "";
 
     TS::Packet PackData;
@@ -82,6 +110,7 @@ namespace Connector_HTTP {
     int ThisNaluSize;
     char VideoCounter = 0;
     char AudioCounter = 0;
+    long long unsigned int lastVid = 0;
     bool IsKeyFrame;
     MP4::AVCC avccbox;
     bool haveAvcc = false;
@@ -92,97 +121,106 @@ namespace Connector_HTTP {
 
     int Segment = -1;
     int temp;
+    int trackID = 0;
+    int audioTrackID = 0;
     unsigned int lastStats = 0;
     conn.setBlocking(false); //do not block on conn.spool() when no data is available
 
     while (conn.connected()){
-      if (conn.spool() || conn.Received().size()){
-        //make sure it ends in a \n
-        if ( *(conn.Received().get().rbegin()) != '\n'){
-          std::string tmp = conn.Received().get();
-          conn.Received().get().clear();
-          if (conn.Received().size()){
-            conn.Received().get().insert(0, tmp);
-          }else{
-            conn.Received().append(tmp);
-          }
-        }
-        if (HTTP_R.Read(conn.Received().get())){
-#if DEBUG >= 5
-          std::cout << "Received request: " << HTTP_R.getUrl() << std::endl;
-#endif
-          conn.setHost(HTTP_R.GetHeader("X-Origin"));
-          streamname = HTTP_R.GetHeader("X-Stream");
-          if ( !ss){
-            ss = Util::Stream::getStream(streamname);
-            if ( !ss.connected()){
-              #if DEBUG >= 1
-              fprintf(stderr, "Could not connect to server!\n");
-              #endif
-              HTTP_S.Clean();
-              HTTP_S.SetBody("No such stream is available on the system. Please try again.\n");
-              conn.SendNow(HTTP_S.BuildResponse("404", "Not found"));
-              ready4data = false;
-              continue;
+      if ( !handlingRequest){
+        if (conn.spool() || conn.Received().size()){
+          if (HTTP_R.Read(conn)){
+  #if DEBUG >= 5
+            std::cout << "Received request: " << HTTP_R.getUrl() << std::endl;
+  #endif
+            conn.setHost(HTTP_R.GetHeader("X-Origin"));
+            AppleCompat = (HTTP_R.GetHeader("User-Agent").find("Apple") != std::string::npos);
+            streamname = HTTP_R.GetHeader("X-Stream");
+            if ( !ss){
+              ss = Util::Stream::getStream(streamname);
+              if ( !ss.connected()){
+                #if DEBUG >= 1
+                fprintf(stderr, "Could not connect to server!\n");
+                #endif
+                HTTP_S.Clean();
+                HTTP_S.SetBody("No such stream is available on the system. Please try again.\n");
+                conn.SendNow(HTTP_S.BuildResponse("404", "Not found"));
+                ready4data = false;
+                continue;
+              }
+              ss.setBlocking(false);
+              Strm.waitForMeta(ss);
             }
-            ss.setBlocking(false);
-            //make sure metadata is received
-            while ( !Strm.metadata && ss.connected()){
-              if (ss.spool()){
-                while (Strm.parsePacket(ss.Received())){
-                  //do nothing
+            if (HTTP_R.url.find(".m3u") == std::string::npos){
+              temp = HTTP_R.url.find("/", 5) + 1;
+              std::string allTracks = HTTP_R.url.substr(temp, HTTP_R.url.find("/", temp) - temp);
+              trackID = atoi(allTracks.c_str());
+              audioTrackID = atoi(allTracks.substr(allTracks.find("_")+1).c_str());
+              temp = HTTP_R.url.find("/", temp) + 1;
+              Segment = atoi(HTTP_R.url.substr(temp, HTTP_R.url.find("_", temp) - temp).c_str());
+              lastVid = Segment * 90;
+              temp = HTTP_R.url.find("_", temp) + 1;
+              int frameCount = atoi(HTTP_R.url.substr(temp, HTTP_R.url.find(".ts", temp) - temp).c_str());
+              if (Strm.metadata.isMember("live")){
+                int seekable = Strm.canSeekms(Segment);
+                if (seekable < 0){
+                  HTTP_S.Clean();
+                  HTTP_S.SetBody("The requested fragment is no longer kept in memory on the server and cannot be served.\n");
+                  conn.SendNow(HTTP_S.BuildResponse("412", "Fragment out of range"));
+                  HTTP_R.Clean(); //clean for any possible next requests
+                  std::cout << "Fragment @ " << Segment << " too old" << std::endl;
+                  continue;
+                }
+                if (seekable > 0){
+                  HTTP_S.Clean();
+                  HTTP_S.SetBody("Proxy, re-request this in a second or two.\n");
+                  conn.SendNow(HTTP_S.BuildResponse("208", "Ask again later"));
+                  HTTP_R.Clean(); //clean for any possible next requests
+                  std::cout << "Fragment @ " << Segment << " not available yet" << std::endl;
+                  continue;
                 }
               }
-            }
-          }
-          if (HTTP_R.url.find(".m3u") == std::string::npos){
-            temp = HTTP_R.url.find("/", 5) + 1;
-            Segment = atoi(HTTP_R.url.substr(temp, HTTP_R.url.find("_", temp) - temp).c_str());
-            temp = HTTP_R.url.find("_", temp) + 1;
-            int frameCount = atoi(HTTP_R.url.substr(temp, HTTP_R.url.find(".ts", temp) - temp).c_str());
-            if (Strm.metadata.isMember("live")){
-              int seekable = Strm.canSeekFrame(Segment);
-              if (seekable < 0){
-                HTTP_S.Clean();
-                HTTP_S.SetBody("The requested fragment is no longer kept in memory on the server and cannot be served.\n");
-                conn.SendNow(HTTP_S.BuildResponse("412", "Fragment out of range"));
-                HTTP_R.Clean(); //clean for any possible next requests
-                std::cout << "Fragment @ F" << Segment << " too old (F" << Strm.metadata["keynum"][0u].asInt() << " - " << Strm.metadata["keynum"][Strm.metadata["keynum"].size() - 1].asInt() << ")" << std::endl;
-                continue;
+              for (int i = 0; i < allTracks.size(); i++){
+                if (allTracks[i] == '_'){
+                  allTracks[i] = ' ';
+                }
               }
-              if (seekable > 0){
-                HTTP_S.Clean();
-                HTTP_S.SetBody("Proxy, re-request this in a second or two.\n");
-                conn.SendNow(HTTP_S.BuildResponse("208", "Ask again later"));
-                HTTP_R.Clean(); //clean for any possible next requests
-                std::cout << "Fragment @ F" << Segment << " not available yet (F" << Strm.metadata["keynum"][0u].asInt() << " - " << Strm.metadata["keynum"][Strm.metadata["keynum"].size() - 1].asInt() << ")" << std::endl;
-                continue;
-              }
-            }
-            std::stringstream sstream;
-            sstream << "f " << Segment << "\n";
-            for (int i = 0; i < frameCount; i++){
-              sstream << "o \n";
-            }
-            ss.SendNow(sstream.str().c_str());
-          }else{
-            if (HTTP_R.url.find(".m3u8") != std::string::npos){
-              manifestType = "audio/x-mpegurl";
+              std::stringstream sstream;
+              sstream << "t " << allTracks << "\n";
+              sstream << "s " << Segment << "\n";
+              sstream << "p " << frameCount << "\n";
+              ss.SendNow(sstream.str().c_str());
+              
+              HTTP_S.Clean();
+              HTTP_S.SetHeader("Content-Type", "video/mp2t");
+              HTTP_S.StartResponse(HTTP_R, conn);
+              handlingRequest = true;
             }else{
-              manifestType = "audio/mpegurl";
+              std::string request = HTTP_R.url.substr(HTTP_R.url.find("/", 5) + 1);
+              if (HTTP_R.url.find(".m3u8") != std::string::npos){
+                manifestType = "audio/x-mpegurl";
+              }else{
+                manifestType = "audio/mpegurl";
+              }
+              HTTP_S.Clean();
+              HTTP_S.SetHeader("Content-Type", manifestType);
+              HTTP_S.SetHeader("Cache-Control", "no-cache");
+              std::string manifest;
+              if (request.find("/") == std::string::npos){
+                manifest = liveIndex(Strm.metadata, Strm.metadata.isMember("live"));
+              }else{
+                int selectId = atoi(request.substr(0,request.find("/")).c_str());
+                manifest = liveIndex(Strm.getTrackById(selectId), Strm.metadata.isMember("live"));
+              }
+              HTTP_S.SetBody(manifest);
+              conn.SendNow(HTTP_S.BuildResponse("200", "OK"));
             }
-            HTTP_S.Clean();
-            HTTP_S.SetHeader("Content-Type", manifestType);
-            HTTP_S.SetHeader("Cache-Control", "no-cache");
-            std::string manifest = liveIndex(Strm.metadata);
-            HTTP_S.SetBody(manifest);
-            conn.SendNow(HTTP_S.BuildResponse("200", "OK"));
+            ready4data = true;
+            HTTP_R.Clean(); //clean for any possible next requests
           }
-          ready4data = true;
-          HTTP_R.Clean(); //clean for any possible next requests
+        }else{
+          Util::sleep(250);
         }
-      }else{
-        Util::sleep(1);
       }
       if (ready4data){
         unsigned int now = Util::epoch();
@@ -190,48 +228,36 @@ namespace Connector_HTTP {
           lastStats = now;
           ss.SendNow(conn.getStats("HTTP_Live").c_str());
         }
-        if (ss.spool()){
+        if (handlingRequest && ss.spool()){
           while (Strm.parsePacket(ss.Received())){
             if (Strm.lastType() == DTSC::PAUSEMARK){
-              TSBuf.flush();
-              if (TSBuf.str().size()){
-                HTTP_S.Clean();
-                HTTP_S.protocol = "HTTP/1.1";
-                HTTP_S.SetHeader("Content-Type", "video/mp2t");
-                HTTP_S.SetHeader("Connection", "keep-alive");
-                HTTP_S.SetBody("");
-                HTTP_S.SetHeader("Content-Length", TSBuf.str().size());
-                conn.SendNow(HTTP_S.BuildResponse("200", "OK"));
-                conn.SendNow(TSBuf.str().c_str(), TSBuf.str().size());
-                TSBuf.str("");
-                PacketNumber = 0;
-              }
-              TSBuf.str("");
+              HTTP_S.Chunkify("", 0, conn);
+              handlingRequest = false;
             }
             if ( !haveAvcc){
-              avccbox.setPayload(Strm.metadata["video"]["init"].asString());
+              avccbox.setPayload(Strm.getTrackById(trackID)["init"].asString());
               haveAvcc = true;
             }
             if (Strm.lastType() == DTSC::VIDEO || Strm.lastType() == DTSC::AUDIO){
               Socket::Buffer ToPack;
               //write PAT and PMT TS packets
-              if (PacketNumber == 0){
+              if (PacketNumber % 42 == 0){
                 PackData.DefaultPAT();
-                TSBuf.write(PackData.ToString(), 188);
+                HTTP_S.Chunkify(PackData.ToString(), 188, conn);
                 PackData.DefaultPMT();
-                TSBuf.write(PackData.ToString(), 188);
+                HTTP_S.Chunkify(PackData.ToString(), 188, conn);
                 PacketNumber += 2;
               }
 
               int PIDno = 0;
               char * ContCounter = 0;
               if (Strm.lastType() == DTSC::VIDEO){
-                IsKeyFrame = Strm.getPacket(0).isMember("keyframe");
+                IsKeyFrame = Strm.getPacket().isMember("keyframe");
                 if (IsKeyFrame){
-                  TimeStamp = (Strm.getPacket(0)["time"].asInt() * 27000);
+                  TimeStamp = (Strm.getPacket()["time"].asInt() * 27000);
                 }
                 ToPack.append(avccbox.asAnnexB());
-                while (Strm.lastData().size()){
+                while (Strm.lastData().size() > 4){
                   ThisNaluSize = (Strm.lastData()[0] << 24) + (Strm.lastData()[1] << 16) + (Strm.lastData()[2] << 8) + Strm.lastData()[3];
                   Strm.lastData().replace(0, 4, TS::NalHeader, 4);
                   if (ThisNaluSize + 4 == Strm.lastData().size()){
@@ -242,15 +268,20 @@ namespace Connector_HTTP {
                     Strm.lastData().erase(0, ThisNaluSize + 4);
                   }
                 }
-                ToPack.prepend(TS::Packet::getPESVideoLeadIn(0ul, Strm.getPacket(0)["time"].asInt() * 90));
-                PIDno = 0x100;
+                ToPack.prepend(TS::Packet::getPESVideoLeadIn(0ul, Strm.getPacket()["time"].asInt() * 90));
+            	PIDno = 0x100 - 1 + Strm.getPacket()["trackid"].asInt();
                 ContCounter = &VideoCounter;
               }else if (Strm.lastType() == DTSC::AUDIO){
-                ToPack.append(TS::GetAudioHeader(Strm.lastData().size(), Strm.metadata["audio"]["init"].asString()));
+                ToPack.append(TS::GetAudioHeader(Strm.lastData().size(), Strm.getTrackById(audioTrackID)["init"].asString()));
                 ToPack.append(Strm.lastData());
-                ToPack.prepend(TS::Packet::getPESAudioLeadIn(ToPack.bytes(1073741824ul), Strm.getPacket(0)["time"].asInt() * 90));
-                PIDno = 0x101;
+                if (AppleCompat){
+                  ToPack.prepend(TS::Packet::getPESAudioLeadIn(ToPack.bytes(1073741824ul), lastVid));
+                }else{
+                  ToPack.prepend(TS::Packet::getPESAudioLeadIn(ToPack.bytes(1073741824ul), Strm.getPacket()["time"].asInt() * 90));
+                }
+            	PIDno = 0x100 - 1 + Strm.getPacket()["trackid"].asInt();
                 ContCounter = &AudioCounter;
+                IsKeyFrame = false;
               }
 
               //initial packet
@@ -265,7 +296,7 @@ namespace Connector_HTTP {
               unsigned int toSend = PackData.AddStuffing(ToPack.bytes(184));
               std::string gonnaSend = ToPack.remove(toSend);
               PackData.FillFree(gonnaSend);
-              TSBuf.write(PackData.ToString(), 188);
+              HTTP_S.Chunkify(PackData.ToString(), 188, conn);
               PacketNumber++;
 
               //rest of packets
@@ -276,7 +307,7 @@ namespace Connector_HTTP {
                 toSend = PackData.AddStuffing(ToPack.bytes(184));
                 gonnaSend = ToPack.remove(toSend);
                 PackData.FillFree(gonnaSend);
-                TSBuf.write(PackData.ToString(), 188);
+                HTTP_S.Chunkify(PackData.ToString(), 188, conn);
                 PacketNumber++;
               }
 
@@ -302,9 +333,26 @@ namespace Connector_HTTP {
 ///\brief The standard process-spawning main function.
 int main(int argc, char ** argv){
   Util::Config conf(argv[0], PACKAGE_VERSION);
-  conf.addConnectorOptions(1935);
+  JSON::Value capa;
+  capa["desc"] = "Enables HTTP protocol Apple-specific streaming (also known as HLS).";
+  capa["deps"] = "HTTP";
+  capa["url_rel"] = "/hls/$/index.m3u8";
+  capa["url_prefix"] = "/hls/$/";
+  capa["socket"] = "http_live";
+  capa["codecs"][0u][0u].append("H264");
+  capa["codecs"][0u][1u].append("AAC");
+  capa["methods"][0u]["handler"] = "http";
+  capa["methods"][0u]["type"] = "html5/application/vnd.apple.mpegurl";
+  capa["methods"][0u]["priority"] = 9ll;
+  conf.addBasicConnectorOptions(capa);
   conf.parseArgs(argc, argv);
-  Socket::Server server_socket = Socket::Server("/tmp/mist/http_live");
+  
+  if (conf.getBool("json")){
+    std::cout << capa.toString() << std::endl;
+    return -1;
+  }
+
+  Socket::Server server_socket = Socket::Server(Util::getTmpFolder() + capa["socket"].asStringRef());
   if ( !server_socket.connected()){
     return 1;
   }

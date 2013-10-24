@@ -1,6 +1,8 @@
 /// \file controller.cpp
 /// Contains all code for the controller executable.
 
+#include <stdio.h>
+//#include <io.h>
 #include <iostream>
 #include <vector>
 #include <sys/stat.h>
@@ -10,6 +12,8 @@
 #include <mist/procs.h>
 #include <mist/auth.h>
 #include <mist/timing.h>
+#include <mist/converter.h>
+#include <mist/stream.h>
 #include "controller_storage.h"
 #include "controller_connectors.h"
 #include "controller_streams.h"
@@ -90,21 +94,25 @@ namespace Controller {
   ///\param out The location to store the resulting configuration.
   void CheckConfig(JSON::Value & in, JSON::Value & out){
     for (JSON::ObjIter jit = in.ObjBegin(); jit != in.ObjEnd(); jit++){
-      if (jit->first == "version"){
+      if (jit->first == "version" || jit->first == "time"){
         continue;
       }
       if (out.isMember(jit->first)){
         if (jit->second != out[jit->first]){
-          if (jit->first != "time"){
-            Log("CONF", std::string("Updated configuration value ") + jit->first);
-          }
+          Log("CONF", std::string("Updated configuration value ") + jit->first);
         }
       }else{
         Log("CONF", std::string("New configuration value ") + jit->first);
       }
     }
+    if (out["config"]["basepath"].asString()[out["config"]["basepath"].asString().size() - 1] == '/'){
+      out["config"]["basepath"] = out["config"]["basepath"].asString().substr(0, out["config"]["basepath"].asString().size() - 1);
+    }
     for (JSON::ObjIter jit = out.ObjBegin(); jit != out.ObjEnd(); jit++){
-      if ( !in.isMember(jit->first) || jit->first == "version"){
+      if (jit->first == "version" || jit->first == "time"){
+        continue;
+      }
+      if ( !in.isMember(jit->first)){
         Log("CONF", std::string("Deleted configuration value ") + jit->first);
       }
     }
@@ -137,6 +145,36 @@ namespace Controller {
   }
 } //Controller namespace
 
+/// the following function is a simple check if the user wants to proceed to fix (y), ignore (n) or abort on (a) a question
+char yna(std::string user_input){
+  if(user_input == "y" || user_input == "Y"){
+    return 'y';
+  }else if(user_input == "n" || user_input == "N"){
+    return 'n';
+  }else if(user_input == "a" || user_input == "A"){
+    return 'a';
+  }else{
+    return 'x';//when no valid option is found, yna returns x
+  }
+}
+
+/// createAccount accepts a string in the form of username:account
+/// and creates an account.
+void createAccount (std::string account){
+  if (account.size() > 0){
+    size_t colon = account.find(':');
+    if (colon != std::string::npos && colon != 0 && colon != account.size()){
+      std::string uname = account.substr(0, colon);
+      std::string pword = account.substr(colon + 1, std::string::npos);
+      Controller::Log("CONF", "Created account " + uname + " through commandline option");
+      Controller::Storage["account"][uname]["password"] = Secure::md5(pword);
+    }
+  }
+  if ( !Controller::Storage["config"].isMember("basePath")){
+    Controller::Storage["config"]["basePath"] = Util::getMyPath();
+  }
+}
+
 ///\brief The main entry point for the controller.
 int main(int argc, char ** argv){
   Controller::Storage = JSON::fromFile("config.json");
@@ -153,7 +191,7 @@ int main(int argc, char ** argv){
     stored_interface["default"] = "0.0.0.0";
   }
   JSON::Value stored_user = JSON::fromString(
-      "{\"long\":\"username\", \"short\":\"u\", \"arg\":\"string\", \"help\":\"Username to drop privileges to, or root to not drop provileges.\"}");
+      "{\"long\":\"username\", \"short\":\"u\", \"arg\":\"string\", \"help\":\"Username to transfer privileges to, default is root.\"}");
   stored_user["default"] = Controller::Storage["config"]["controller"]["username"];
   if ( !stored_user["default"]){
     stored_user["default"] = "root";
@@ -164,10 +202,13 @@ int main(int argc, char ** argv){
   conf.addOption("username", stored_user);
   conf.addOption("daemonize",
       JSON::fromString(
-          "{\"long\":\"daemon\", \"short\":\"d\", \"default\":1, \"long_off\":\"nodaemon\", \"short_off\":\"n\", \"help\":\"Whether or not to daemonize the process after starting.\"}"));
+          "{\"long\":\"daemon\", \"short\":\"d\", \"default\":1, \"long_off\":\"nodaemon\", \"short_off\":\"n\", \"help\":\"Turns deamon mode on (-d) or off (-n). -d (default) runs quietly in background, -n enables verbose in foreground.\"}"));
   conf.addOption("account",
       JSON::fromString(
           "{\"long\":\"account\", \"short\":\"a\", \"arg\":\"string\" \"default\":\"\", \"help\":\"A username:password string to create a new account with.\"}"));
+  conf.addOption("configFile",
+      JSON::fromString(
+          "{\"long\":\"config\", \"short\":\"c\", \"arg\":\"string\" \"default\":\"config.json\", \"help\":\"Specify a config file other than default.\"}"));
   conf.addOption("uplink",
       JSON::fromString(
           "{\"default\":\"\", \"arg\":\"string\", \"help\":\"MistSteward uplink host and port.\", \"short\":\"U\", \"long\":\"uplink\"}"));
@@ -179,17 +220,96 @@ int main(int argc, char ** argv){
           "{\"default\":\"" COMPILED_PASSWORD "\", \"arg\":\"string\", \"help\":\"MistSteward uplink password.\", \"short\":\"P\", \"long\":\"uplink-pass\"}"));
   conf.parseArgs(argc, argv);
 
-  std::string account = conf.getString("account");
-  if (account.size() > 0){
-    size_t colon = account.find(':');
-    if (colon != std::string::npos && colon != 0 && colon != account.size()){
-      std::string uname = account.substr(0, colon);
-      std::string pword = account.substr(colon + 1, std::string::npos);
-      Controller::Log("CONF", "Created account " + uname + " through commandline option");
-      Controller::Storage["account"][uname]["password"] = Secure::md5(pword);
+  //Input custom config here
+  Controller::Storage = JSON::fromFile(conf.getString("configFile"));
+
+  //check for port, interface and username in arguments
+  //if they are not there, take them from config file, if there
+  if (conf.getOption("listen_port", true).size() <= 1){
+    if (Controller::Storage["config"]["controller"]["port"]){
+      conf.getOption("listen_port") = Controller::Storage["config"]["controller"]["port"];
     }
   }
-
+  if (conf.getOption("listen_interface", true).size() <= 1){
+    if (Controller::Storage["config"]["controller"]["interface"]){
+      conf.getOption("listen_interface") = Controller::Storage["config"]["controller"]["interface"];
+    }
+  }
+  if (conf.getOption("username", true).size() <= 1){
+    if (Controller::Storage["config"]["controller"]["username"]){
+      conf.getOption("username") = Controller::Storage["config"]["controller"]["username"];
+    }
+  }
+  
+  
+  JSON::Value capabilities;
+  //list available protocols and report about them
+  std::deque<std::string> execs;
+  Util::getMyExec(execs);
+  std::string arg_one;
+  char const * conn_args[] = {0, "-j", 0};
+  for (std::deque<std::string>::iterator it = execs.begin(); it != execs.end(); it++){
+    if ((*it).substr(0, 8) == "MistConn"){
+      arg_one = Util::getMyPath() + (*it);
+      conn_args[0] = arg_one.c_str();
+      capabilities["connectors"][(*it).substr(8)] = JSON::fromString(Util::Procs::getOutputOf((char**)conn_args));
+      if (capabilities["connectors"][(*it).substr(8)].size() < 1){
+        capabilities["connectors"].removeMember((*it).substr(8));
+      }
+    }
+  }
+  
+  createAccount(conf.getString("account"));
+  
+  /// User friendliness input added at this line
+  if (isatty(fileno(stdin))){
+    //check for username
+    if ( !Controller::Storage.isMember("account") || Controller::Storage["account"].size() < 1){
+      std::string in_string = "";
+      while(yna(in_string) == 'x'){
+        std::cerr << "Account not set, do you want to create an account? (y)es, (n)o, (a)bort: ";
+        std::getline(std::cin, in_string);
+        if (yna(in_string) == 'y'){
+          //create account
+          std::string usr_string = "";
+          while(!(Controller::Storage.isMember("account") && Controller::Storage["account"].size() > 0)){
+            std::cerr << "Please type in the username, a colon and a password in the following format; username:password" << std::endl << ": ";
+            std::getline(std::cin, usr_string);
+            createAccount(usr_string);
+          }
+        }else if(yna(in_string) == 'a'){
+          //abort controller startup
+          return 0;
+        }
+      }
+    }
+    //check for protocols
+    if ( !Controller::Storage.isMember("config") || !Controller::Storage["config"].isMember("protocols") || Controller::Storage["config"]["protocols"].size() < 1){
+      std::string in_string = "";
+      while(yna(in_string) == 'x'){
+        std::cerr << "Protocols not set, do you want to enable default protocols? (y)es, (n)o, (a)bort: ";
+        std::getline(std::cin, in_string);
+        if (yna(in_string) == 'y'){
+          //create protocols
+          for (JSON::ObjIter it = capabilities["connectors"].ObjBegin(); it != capabilities["connectors"].ObjEnd(); it++){
+            if ( !it->second.isMember("required")){
+              JSON::Value newProtocol;
+              newProtocol["connector"] = it->first;
+              Controller::Storage["config"]["protocols"].append(newProtocol);
+            }
+          }
+        }else if(yna(in_string) == 'a'){
+          //abort controller startup
+          return 0;
+        }
+      }
+    }
+    //check for streams
+    if ( !Controller::Storage.isMember("streams") || Controller::Storage["streams"].size() < 1){
+      std::cerr << "No streams configured, remember to set up streams through local settings page on port " << conf.getInteger("listen_port") << " or using the API." << std::endl;
+    }
+  }
+  
   std::string uplink_addr = conf.getString("uplink");
   std::string uplink_host = "";
   int uplink_port = 0;
@@ -206,8 +326,7 @@ int main(int argc, char ** argv){
   time_t lastuplink = 0;
   time_t processchecker = 0;
   Socket::Server API_Socket = Socket::Server(conf.getInteger("listen_port"), conf.getString("listen_interface"), true);
-  mkdir("/tmp/mist", S_IRWXU | S_IRWXG | S_IRWXO); //attempt to create /tmp/mist/ - ignore failures
-  Socket::Server Stats_Socket = Socket::Server("/tmp/mist/statistics", true);
+  Socket::Server Stats_Socket = Socket::Server(Util::getTmpFolder() + "statistics", true);
   conf.activate();
   Socket::Connection Incoming;
   std::vector<Controller::ConnectedUser> users;
@@ -218,14 +337,19 @@ int main(int argc, char ** argv){
   Controller::ConnectedUser * uplink = 0;
   Controller::Log("CONF", "Controller started");
   conf.activate();
+  
+  //Create a converter class and automatically load in all encoders.
+  Converter::Converter myConverter;
+  
   while (API_Socket.connected() && conf.is_active){
-    usleep(10000); //sleep for 10 ms - prevents 100% CPU time
+    Util::sleep(10);//sleep for 10 ms - prevents 100% CPU time
 
     if (Util::epoch() - processchecker > 10){
       processchecker = Util::epoch();
-      Controller::CheckProtocols(Controller::Storage["config"]["protocols"]);
+      Controller::CheckProtocols(Controller::Storage["config"]["protocols"], capabilities);
       Controller::CheckAllStreams(Controller::Storage["streams"]);
       Controller::CheckStats(Controller::Storage["statistics"]);
+      myConverter.updateStatus();
     }
     if (uplink_port && Util::epoch() - lastuplink > UPLINK_INTERVAL){
       lastuplink = Util::epoch();
@@ -346,17 +470,7 @@ int main(int argc, char ** argv){
           break;
         }
         if (it->C.spool() || it->C.Received().size()){
-          if ( *(it->C.Received().get().rbegin()) != '\n'){
-            std::string tmp = it->C.Received().get();
-            it->C.Received().get().clear();
-            if (it->C.Received().size()){
-              it->C.Received().get().insert(0, tmp);
-            }else{
-              it->C.Received().append(tmp);
-            }
-            continue;
-          }
-          if (it->H.Read(it->C.Received().get())){
+          if (it->H.Read(it->C)){
             Response.null(); //make sure no data leaks from previous requests
             if (it->clientMode){
               // In clientMode, requests are reversed. These are connections we initiated to GearBox.
@@ -375,7 +489,8 @@ int main(int argc, char ** argv){
                     Response["log"] = Controller::Storage["log"];
                     Response["statistics"] = Controller::Storage["statistics"];
                     Response["authorize"]["username"] = conf.getString("uplink-name");
-                    Controller::checkCapable(Response["capabilities"]);
+                    Controller::checkCapable(capabilities);
+                    Response["capabilities"] = capabilities;
                     Controller::Log("UPLK", "Responding to login challenge: " + Request["authorize"]["challenge"].asString());
                     Response["authorize"]["password"] = Secure::md5(conf.getString("uplink-pass") + Request["authorize"]["challenge"].asString());
                     it->H.Clean();
@@ -389,7 +504,7 @@ int main(int argc, char ** argv){
               }else{
                 if (Request.isMember("config")){
                   Controller::CheckConfig(Request["config"], Controller::Storage["config"]);
-                  Controller::CheckProtocols(Controller::Storage["config"]["protocols"]);
+                  Controller::CheckProtocols(Controller::Storage["config"]["protocols"], capabilities);
                 }
                 if (Request.isMember("streams")){
                   Controller::CheckStreams(Request["streams"], Controller::Storage["streams"]);
@@ -416,17 +531,41 @@ int main(int argc, char ** argv){
                   //Parse config and streams from the request.
                   if (Request.isMember("config")){
                     Controller::CheckConfig(Request["config"], Controller::Storage["config"]);
-                    Controller::CheckProtocols(Controller::Storage["config"]["protocols"]);
+                    Controller::CheckProtocols(Controller::Storage["config"]["protocols"], capabilities);
                   }
                   if (Request.isMember("streams")){
                     Controller::CheckStreams(Request["streams"], Controller::Storage["streams"]);
                     Controller::CheckAllStreams(Controller::Storage["streams"]);
                   }
                   if (Request.isMember("capabilities")){
-                    Controller::checkCapable(Response["capabilities"]);
+                    Controller::checkCapable(capabilities);
+                    Response["capabilities"] = capabilities;
+                  }
+                  if (Request.isMember("conversion")){
+                    if (Request["conversion"].isMember("encoders")){
+                      Response["conversion"]["encoders"] = myConverter.getEncoders();
+                    }
+                    if (Request["conversion"].isMember("query")){
+                      if (Request["conversion"]["query"].isMember("path")){
+                        Response["conversion"]["query"] = myConverter.queryPath(Request["conversion"]["query"]["path"].asString());
+                      }else{
+                        Response["conversion"]["query"] = myConverter.queryPath("./");
+                      }
+                    }
+                    if (Request["conversion"].isMember("convert")){
+                      for (JSON::ObjIter it = Request["conversion"]["convert"].ObjBegin(); it != Request["conversion"]["convert"].ObjEnd(); it++){
+                        myConverter.startConversion(it->first,it->second);
+                      }
+                    }
+                    if (Request["conversion"].isMember("status") || Request["conversion"].isMember("convert")){
+                      Response["conversion"]["status"] = myConverter.getStatus();
+                      if (Request["conversion"].isMember("clear")){
+                        myConverter.clearStatus();
+                      }
+                    }
                   }
                   if (Request.isMember("save")){
-                    Controller::WriteFile("config.json", Controller::Storage.toString());
+                    Controller::WriteFile(conf.getString("configFile"), Controller::Storage.toString());
                     Controller::Log("CONF", "Config written to file on request through API");
                   }
                   //sent current configuration, no matter if it was changed or not
@@ -447,6 +586,7 @@ int main(int argc, char ** argv){
                     Controller::Storage["log"].null();
                     Controller::Storage["statistics"].null();
                   }
+                  
                 }
                 jsonp = "";
                 if (it->H.GetVar("callback") != ""){
@@ -473,7 +613,7 @@ int main(int argc, char ** argv){
   }
   API_Socket.close();
   Controller::Log("CONF", "Controller shutting down");
-  Controller::WriteFile("config.json", Controller::Storage.toString());
+  Controller::WriteFile(conf.getString("configFile"), Controller::Storage.toString());
   Util::Procs::StopAll();
   std::cout << "Killed all processes, wrote config to disk. Exiting." << std::endl;
   return 0;

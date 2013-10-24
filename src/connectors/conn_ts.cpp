@@ -29,7 +29,7 @@ namespace Connector_TS {
   ///\param conn A socket describing the connection the client.
   ///\param streamName The stream to connect to.
   ///\return The exit code of the connector.
-  int tsConnector(Socket::Connection conn, std::string streamName){
+  int tsConnector(Socket::Connection conn, std::string streamName, std::string trackIDs){
     std::string ToPack;
     TS::Packet PackData;
     std::string DTMIData;
@@ -59,15 +59,47 @@ namespace Connector_TS {
           conn.close();
           break;
         }
-        ss.SendNow("p\n");
+
+        if(trackIDs == ""){
+          // no track ids given? Find the first video and first audio track (if available) and use those!
+          int videoID = -1;
+          int audioID = -1;
+
+          Strm.waitForMeta(ss);
+          
+          if (Strm.metadata.isMember("tracks")){
+
+            for (JSON::ObjIter trackIt = Strm.metadata["tracks"].ObjBegin(); trackIt != Strm.metadata["tracks"].ObjEnd(); trackIt++){
+
+              if (audioID == -1 && trackIt->second["type"].asString() == "audio"){
+                audioID = trackIt->second["trackid"].asInt();
+                if( trackIDs != ""){
+                  trackIDs += " " + trackIt->second["trackid"].asString();
+                }else{
+                    trackIDs = trackIt->second["trackid"].asString();
+                }
+              }
+
+              if (videoID == -1 && trackIt->second["type"].asString() == "video"){
+                videoID = trackIt->second["trackid"].asInt();
+                if( trackIDs != ""){
+                  trackIDs += " " + trackIt->second["trackid"].asString();
+                }else{
+                  trackIDs = trackIt->second["trackid"].asString();
+                }
+              }
+
+            }	// for iterator
+          } // if isMember("tracks")
+        } // if trackIDs == ""
+
+        std::string cmd = "t " + trackIDs + "\ns 0\np\n";
+        ss.SendNow( cmd );
         inited = true;
       }
       if (ss.spool()){
         while (Strm.parsePacket(ss.Received())){
-          if ( !haveAvcc){
-            avccbox.setPayload(Strm.metadata["video"]["init"].asString());
-            haveAvcc = true;
-          }
+
           std::stringstream TSBuf;
           Socket::Buffer ToPack;
           //write PAT and PMT TS packets
@@ -82,12 +114,17 @@ namespace Connector_TS {
           int PIDno = 0;
           char * ContCounter = 0;
           if (Strm.lastType() == DTSC::VIDEO){
-            IsKeyFrame = Strm.getPacket(0).isMember("keyframe");
+		      if ( !haveAvcc){
+		          avccbox.setPayload(Strm.getTrackById(Strm.getPacket()["trackid"].asInt())["init"].asString());
+		        haveAvcc = true;
+		      }
+
+            IsKeyFrame = Strm.getPacket().isMember("keyframe");
             if (IsKeyFrame){
-              TimeStamp = (Strm.getPacket(0)["time"].asInt() * 27000);
+              TimeStamp = (Strm.getPacket()["time"].asInt() * 27000);
             }
             ToPack.append(avccbox.asAnnexB());
-            while (Strm.lastData().size()){
+                while (Strm.lastData().size() > 4){
               ThisNaluSize = (Strm.lastData()[0] << 24) + (Strm.lastData()[1] << 16) + (Strm.lastData()[2] << 8) + Strm.lastData()[3];
               Strm.lastData().replace(0, 4, TS::NalHeader, 4);
               if (ThisNaluSize + 4 == Strm.lastData().size()){
@@ -98,15 +135,16 @@ namespace Connector_TS {
                 Strm.lastData().erase(0, ThisNaluSize + 4);
               }
             }
-            ToPack.prepend(TS::Packet::getPESVideoLeadIn(0ul, Strm.getPacket(0)["time"].asInt() * 90));
-            PIDno = 0x100;
+            ToPack.prepend(TS::Packet::getPESVideoLeadIn(0ul, Strm.getPacket()["time"].asInt() * 90));
+            PIDno = 0x100 - 1 + Strm.getPacket()["trackid"].asInt();
             ContCounter = &VideoCounter;
           }else if (Strm.lastType() == DTSC::AUDIO){
-            ToPack.append(TS::GetAudioHeader(Strm.lastData().size(), Strm.metadata["audio"]["init"].asString()));
+                ToPack.append(TS::GetAudioHeader(Strm.lastData().size(), Strm.getTrackById(Strm.getPacket()["trackid"].asInt())["init"].asString()));
             ToPack.append(Strm.lastData());
-            ToPack.prepend(TS::Packet::getPESAudioLeadIn(ToPack.bytes(1073741824ul), Strm.getPacket(0)["time"].asInt() * 90));
-            PIDno = 0x101;
+            ToPack.prepend(TS::Packet::getPESAudioLeadIn(ToPack.bytes(1073741824ul), Strm.getPacket()["time"].asInt() * 90));
+            PIDno = 0x100 - 1 + Strm.getPacket()["trackid"].asInt();
             ContCounter = &AudioCounter;
+                IsKeyFrame = false;
           }
 
           //initial packet
@@ -144,6 +182,9 @@ namespace Connector_TS {
           TSBuf.str("");
           PacketNumber = 0;
         }
+      }else{
+        Util::sleep(1000);
+        conn.spool();
       }
     }
     return 0;
@@ -152,10 +193,33 @@ namespace Connector_TS {
 
 int main(int argc, char ** argv){
   Util::Config conf(argv[0], PACKAGE_VERSION);
+  JSON::Value capa;
+  capa["desc"] = "Enables the raw MPEG Transport Stream protocol over TCP.";
+  capa["deps"] = "";
+  capa["required"]["streamname"]["name"] = "Stream";
+  capa["required"]["streamname"]["help"] = "What streamname to serve. For multiple streams, add this protocol multiple times using different ports.";
+  capa["required"]["streamname"]["type"] = "str";
+  capa["required"]["streamname"]["option"] = "--stream";
+  capa["optional"]["tracks"]["name"] = "Tracks";
+  capa["optional"]["tracks"]["help"] = "The track IDs of the stream that this connector will transmit separated by spaces";
+  capa["optional"]["tracks"]["type"] = "str";
+  capa["optional"]["tracks"]["option"] = "--tracks";
   conf.addOption("streamname",
-      JSON::fromString("{\"arg\":\"string\",\"arg_num\":1,\"help\":\"The name of the stream that this connector will transmit.\"}"));
-  conf.addConnectorOptions(8888);
-  conf.parseArgs(argc, argv);
+      JSON::fromString("{\"arg\":\"string\",\"short\":\"s\",\"long\":\"stream\",\"help\":\"The name of the stream that this connector will transmit.\"}"));
+  conf.addOption("tracks",
+      JSON::fromString("{\"arg\":\"string\",\"value\":[\"\"],\"short\": \"t\",\"long\":\"tracks\",\"help\":\"The track IDs of the stream that this connector will transmit separated by spaces.\"}"));
+  conf.addConnectorOptions(8888, capa);
+  bool ret = conf.parseArgs(argc, argv);
+  if (conf.getBool("json")){
+    std::cout << capa.toString() << std::endl;
+    return -1;
+  }
+  if (!ret){
+    std::cerr << "Usage error: missing argument(s)." << std::endl;
+    conf.printHelp(std::cout);
+    return 1;
+  }
+  
   Socket::Server server_socket = Socket::Server(conf.getInteger("listen_port"), conf.getString("listen_interface"));
   if ( !server_socket.connected()){
     return 1;
@@ -167,7 +231,7 @@ int main(int argc, char ** argv){
     if (S.connected()){ //check if the new connection is valid
       pid_t myid = fork();
       if (myid == 0){ //if new child, start MAINHANDLER
-        return Connector_TS::tsConnector(S, conf.getString("streamname"));
+        return Connector_TS::tsConnector(S, conf.getString("streamname"), conf.getString("tracks"));
       }else{ //otherwise, do nothing or output debugging text
 #if DEBUG >= 5
         fprintf(stderr, "Spawned new process %i for socket %i\n", (int)myid, S.getSocket());

@@ -31,11 +31,11 @@ namespace Buffer {
       return;
     }
     std::string double_newline = "\n\n";
-    Socket::Connection StatsSocket = Socket::Connection("/tmp/mist/statistics", true);
+    Socket::Connection StatsSocket = Socket::Connection(Util::getTmpFolder() + "statistics", true);
     while (buffer_running){
       Util::sleep(1000); //sleep one second
       if ( !StatsSocket.connected()){
-        StatsSocket = Socket::Connection("/tmp/mist/statistics", true);
+        StatsSocket = Socket::Connection(Util::getTmpFolder() + "statistics", true);
       }
       if (StatsSocket.connected()){
         Stream::get()->getReadLock();
@@ -50,12 +50,12 @@ namespace Buffer {
   ///\brief A function running in a thread to handle a new user connection.
   ///\param v_usr The user that is connected.
   void handleUser(void * v_usr){
+    std::set<int> newSelect;
     user * usr = (user*)v_usr;
     thisStream->addUser(usr);
 #if DEBUG >= 5
     std::cerr << "Thread launched for user " << usr->MyStr << ", socket number " << usr->S.getSocket() << std::endl;
 #endif
-
     Stream::get()->getReadLock();
     usr->myRing = thisStream->getRing();
     if (thisStream->getStream()->metadata && thisStream->getHeader().size() > 0){
@@ -69,14 +69,7 @@ namespace Buffer {
     }
     Stream::get()->dropReadLock();
     while (usr->S.connected()){
-      Util::sleep(5); //sleep 5ms
-      if ( !usr->myRing->playCount || !usr->Send()){
-        if (usr->myRing->updated){
-          Stream::get()->getReadLock();
-          usr->S.SendNow(Stream::get()->getStream()->metadata.toNetPacked());
-          Stream::get()->dropReadLock();
-          usr->myRing->updated = false;
-        }
+      if ( !usr->myRing->playCount || !usr->Send(newSelect)){
         if (usr->S.spool()){
           while (usr->S.Received().size()){
             //delete anything that doesn't end with a newline
@@ -113,23 +106,31 @@ namespace Buffer {
                   usr->curr_down = (usr->tmpStats.down - usr->lastStats.down) / secs;
                   usr->lastStats = usr->tmpStats;
                   thisStream->saveStats(usr->MyStr, usr->tmpStats);
+                  Stream::get()->getReadLock();
+                  usr->S.SendNow(thisStream->getHeader());
+                  Stream::get()->dropReadLock();
+                  break;
+                }
+                case 't': {
+                  if (usr->S.Received().get().size() >= 3){
+                    newSelect.clear();
+                    std::string tmp = usr->S.Received().get().substr(2);
+                    while (tmp != ""){
+                      newSelect.insert(atoi(tmp.substr(0,tmp.find(' ')).c_str()));
+                      if (tmp.find(' ') != std::string::npos){
+                        tmp.erase(0,tmp.find(' ')+1);
+                      }else{
+                        tmp = "";
+                      }
+                    }
+                  }
                   break;
                 }
                 case 's': { //second-seek
                   unsigned int ms = JSON::Value(usr->S.Received().get().substr(2)).asInt();
                   usr->myRing->waiting = false;
                   usr->myRing->starved = false;
-                  usr->myRing->b = thisStream->getStream()->msSeek(ms);
-                  if (usr->myRing->playCount > 0){
-                    usr->myRing->playCount = 0;
-                  }
-                  break;
-                }
-                case 'f': { //frame-seek
-                  unsigned int frameno = JSON::Value(usr->S.Received().get().substr(2)).asInt();
-                  usr->myRing->waiting = false;
-                  usr->myRing->starved = false;
-                  usr->myRing->b = thisStream->getStream()->frameSeek(frameno);
+                  usr->myRing->b = thisStream->getStream()->msSeek(ms, newSelect);
                   if (usr->myRing->playCount > 0){
                     usr->myRing->playCount = 0;
                   }
@@ -137,6 +138,11 @@ namespace Buffer {
                 }
                 case 'p': { //play
                   usr->myRing->playCount = -1;
+                  if (usr->S.Received().get().size() >= 2){
+                    usr->playUntil = atoi(usr->S.Received().get().substr(2).c_str());
+                  }else{
+                    usr->playUntil = 0;
+                  }
                   break;
                 }
                 case 'o': { //once-play
@@ -153,6 +159,9 @@ namespace Buffer {
               usr->S.Received().get().clear();
             }
           }
+        }
+        if (usr->myRing->waiting){
+          Util::sleep(300); //sleep 5ms
         }
       }
     }
@@ -181,7 +190,6 @@ namespace Buffer {
       if (((now - timeDiff) >= lastPacket) || (lastPacket - (now - timeDiff) > 15000)){
         thisStream->getWriteLock();
         if (thisStream->getStream()->parsePacket(inBuffer)){
-          thisStream->getStream()->outPacket(0);
           lastPacket = thisStream->getStream()->getTime();
           if ((now - timeDiff - lastPacket) > 15000 || (now - timeDiff - lastPacket < -15000)){
             timeDiff = now - lastPacket;
@@ -203,29 +211,38 @@ namespace Buffer {
   ///\brief A function running a thread to handle input data through rtmp push.
   ///\param empty A null pointer.
   void handlePushin(void * empty){
+    bool connected = false;
     if (empty != 0){
       return;
     }
     while (buffer_running){
       if (thisStream->getIPInput().connected()){
+        if (!connected){
+          connected = true;
+          thisStream->getIPInput().setBlocking(true);
+        }
         if (thisStream->getIPInput().spool()){
-          bool packed_parsed = false;
-          do{
-            thisStream->getWriteLock();
-            if (thisStream->getStream()->parsePacket(thisStream->getIPInput().Received())){
-              thisStream->getStream()->outPacket(0);
-              thisStream->dropWriteLock(true);
-              packed_parsed = true;
-            }else{
-              thisStream->dropWriteLock(false);
-              packed_parsed = false;
-              Util::sleep(1); //1ms wait
+
+           thisStream->getWriteLock();
+           bool newPackets = false;
+            while (thisStream->getStream()->parsePacket(thisStream->getIPInput().Received())){
+              if (thisStream->getStream()->metadata.isMember("reset")){
+                thisStream->disconnectUsers();
+                thisStream->getStream()->metadata.removeMember("reset");
+                thisStream->getStream()->metadata.netPrepare();
+              }
+              newPackets = true;
             }
-          }while (packed_parsed);
-        }else{
-          Util::sleep(1); //1ms wait
+            thisStream->dropWriteLock(newPackets);
+
         }
       }else{
+        if (connected){
+          connected = false;
+          thisStream->getWriteLock();
+          thisStream->getStream()->endStream();
+          thisStream->dropWriteLock(true);
+        }
         Util::sleep(1000); //1s wait
       }
     }
@@ -246,7 +263,7 @@ namespace Buffer {
         JSON::fromString("{\"default\":0, \"help\":\"Report stats to a controller process.\", \"short\":\"s\", \"long\":\"reportstats\"}"));
     conf.addOption("time",
         JSON::fromString(
-            "{\"default\":0, \"arg\": \"integer\", \"help\":\"Buffer a specied amount of time in ms.\", \"short\":\"t\", \"long\":\"time\"}"));
+            "{\"default\":20000, \"arg\": \"integer\", \"help\":\"Buffer a specied amount of time in ms.\", \"short\":\"t\", \"long\":\"time\"}"));
     conf.parseArgs(argc, argv);
 
     std::string name = conf.getString("stream_name");

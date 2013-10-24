@@ -29,7 +29,6 @@ namespace Buffer {
 
   ///\brief Drops held DTSC::Ring class, if one is held.
   user::~user(){
-    Stream::get()->dropRing(myRing);
   } //destructor
 
   ///\brief Disconnects the current user. Doesn't do anything if already disconnected.
@@ -68,7 +67,7 @@ namespace Buffer {
   ///\brief Try to send the current buffer.
   ///
   ///\return True if the send was succesful, false otherwise.
-  bool user::Send(){
+  bool user::Send(std::set<int> & allowedTracks){
     if ( !myRing){
       return false;
     } //no ring!
@@ -77,11 +76,14 @@ namespace Buffer {
     } //cancel if not connected
     if (myRing->waiting){
       Stream::get()->waitForData();
-      if ( !myRing->waiting){
+      if (!Stream::get()->getStream()->isNewest(myRing->b)){
+        myRing->waiting = false;
         Stream::get()->getReadLock();
-        if (Stream::get()->getStream()->getPacket(myRing->b).isMember("keyframe") && myRing->playCount > 0){
+        myRing->b = Stream::get()->getStream()->getNext(myRing->b, allowedTracks);
+        if ((Stream::get()->getStream()->getPacket(myRing->b).isMember("keyframe") && (myRing->playCount > 0)) || (playUntil && playUntil <= Stream::get()->getStream()->getPacket(myRing->b)["time"].asInt())){
           myRing->playCount--;
-          if ( !myRing->playCount){
+          if (myRing->playCount < 1 || playUntil <= Stream::get()->getStream()->getPacket(myRing->b)["time"].asInt()){
+            myRing->playCount = 0;
             JSON::Value pausemark;
             pausemark["datatype"] = "pause_marker";
             pausemark["time"] = Stream::get()->getStream()->getPacket(myRing->b)["time"].asInt();
@@ -105,14 +107,17 @@ namespace Buffer {
     if (doSend(Stream::get()->getStream()->outPacket(myRing->b).c_str(), Stream::get()->getStream()->outPacket(myRing->b).length())){
       //switch to next buffer
       currsend = 0;
-      if (myRing->b <= 0){
+      if (Stream::get()->getStream()->isNewest(myRing->b)){
+        //no next buffer? go in waiting mode.
         myRing->waiting = true;
+        Stream::get()->dropReadLock();
         return false;
-      } //no next buffer? go in waiting mode.
-      myRing->b--;
-      if (Stream::get()->getStream()->getPacket(myRing->b).isMember("keyframe") && myRing->playCount > 0){
+      }
+      myRing->b = Stream::get()->getStream()->getNext(myRing->b, allowedTracks);
+      if ((Stream::get()->getStream()->getPacket(myRing->b).isMember("keyframe") && (myRing->playCount > 0)) || (playUntil && playUntil <= Stream::get()->getStream()->getPacket(myRing->b)["time"].asInt())){
         myRing->playCount--;
-        if ( !myRing->playCount){
+        if (myRing->playCount < 1 || playUntil <= Stream::get()->getStream()->getPacket(myRing->b)["time"].asInt()){
+          myRing->playCount = 0;
           JSON::Value pausemark;
           pausemark["datatype"] = "pause_marker";
           pausemark["time"] = Stream::get()->getStream()->getPacket(myRing->b)["time"].asInt();
@@ -124,6 +129,7 @@ namespace Buffer {
       return false;
     } //completed a send
     Stream::get()->dropReadLock();
+    Util::sleep(300);
     return true;
   } //send
 

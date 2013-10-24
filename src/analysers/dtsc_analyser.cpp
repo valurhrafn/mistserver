@@ -38,11 +38,13 @@ namespace Analysers {
     long long unsigned int bfrm_min = 0xffffffff;
     long long unsigned int bfrm_max = 0;
     long long unsigned int bps = 0;
+    
+    F.getMeta().null();
 
-    F.seekNext();
-    while ( !F.getJSON().isNull()){
-      std::cout << F.getJSON().toPrettyString() << std::endl;
+    F.parseNext();
+    while (F.getJSON()){
       nowpack = F.getJSON()["time"].asInt();
+      std::cout << F.getJSON().toPrettyString() << std::endl;
       if (firstpack == 0){
         firstpack = nowpack;
       }
@@ -94,7 +96,7 @@ namespace Analysers {
         totalvideo += F.getJSON()["data"].asString().size();
         lastvideo = nowpack;
       }
-      F.seekNext();
+      F.parseNext();
     }
 
     std::cout << std::endl << "Summary:" << std::endl;
