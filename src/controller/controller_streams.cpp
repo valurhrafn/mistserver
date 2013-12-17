@@ -17,7 +17,13 @@ namespace Controller {
   ///\param two The second stream for the comparison.
   ///\return True if the streams are equal, false otherwise.
   bool streamsEqual(JSON::Value & one, JSON::Value & two){
-    if ( !one.isMember("source") || !two.isMember("source") || one["source"] != two["source"]){
+    if (one.isMember("source") != two.isMember("source") || one["source"] != two["source"]){
+      return false;
+    }
+    if (one.isMember("DVR") != two.isMember("DVR") || (one.isMember("DVR") && one["DVR"] != two["DVR"])){
+      return false;
+    }
+    if (one.isMember("cut") != two.isMember("cut") || (one.isMember("cut") && one["cut"] != two["cut"])){
       return false;
     }
     return true;
@@ -36,24 +42,25 @@ namespace Controller {
     if (data.isMember("source")){
       URL = data["source"].asString();
     }
-    std::string cmd1, cmd2, cmd3;
+    std::string buffcmd;
     if (URL == ""){
       Log("STRM", "Error for stream " + name + "! Source parameter missing.");
       data["error"] = "Missing source parameter!";
       return;
     }
+    buffcmd = "MistBuffer";
+    if (data.isMember("DVR") && data["DVR"].asInt() > 0){
+      data["DVR"] = data["DVR"].asInt();
+      buffcmd += " -t " + data["DVR"].asString();
+    }
+    buffcmd += " -s " + name;
     if (URL.substr(0, 4) == "push"){
       std::string pusher = URL.substr(7);
-      if (data.isMember("DVR") && data["DVR"].asInt() > 0){
-        data["DVR"] = data["DVR"].asInt();
-        cmd2 = "MistBuffer -t " + data["DVR"].asString() + " -s " + name + " " + pusher;
-      }else{
-        cmd2 = "MistBuffer -s " + name + " " + pusher;
-      }
-      Util::Procs::Start(name, Util::getMyPath() + cmd2);
+      Util::Procs::Start(name, Util::getMyPath() + buffcmd + " " + pusher);
       Log("BUFF", "(re)starting stream buffer " + name + " for push data from " + pusher);
     }else{
       if (URL.substr(0, 1) == "/"){
+        data.removeMember("error");
         struct stat fileinfo;
         if (stat(URL.c_str(), &fileinfo) != 0 || S_ISDIR(fileinfo.st_mode)){
           Log("BUFF", "Warning for VoD stream " + name + "! File not found: " + URL);
@@ -61,7 +68,38 @@ namespace Controller {
           data["online"] = 0;
           return;
         }
-        if ( !data.isMember("meta") || !data["meta"].isMember("tracks")){
+        bool getMeta = false;
+        if ( !data.isMember("l_meta") || fileinfo.st_mtime != data["l_meta"].asInt()){
+          getMeta = true;
+          data["l_meta"] = (long long)fileinfo.st_mtime;
+        }
+        if ( !getMeta && data.isMember("meta") && data["meta"].isMember("tracks")){
+          for (JSON::ObjIter trIt = data["meta"]["tracks"].ObjBegin(); trIt != data["meta"]["tracks"].ObjEnd(); trIt++){
+            if (trIt->second["codec"] == "H264"){
+              if ( !trIt->second.isMember("init")){
+                getMeta = true;
+              }else{
+                if (trIt->second["init"].asString().size() < 4){
+                  Log("WARN", "Source file "+URL+" does not contain H264 init data that MistServer can interpret.");
+                  data["error"] = "Invalid?";
+                }else{
+                  if (trIt->second["init"].asString().c_str()[1] != 0x42){
+                    Log("WARN", "Source file "+URL+" is not H264 Baseline - convert to baseline profile for best compatibility.");
+                    data["error"] = "Not optimal (details in log)";
+                  }else{
+                    if (trIt->second["init"].asString().c_str()[3] > 30){
+                      Log("WARN", "Source file "+URL+" is higher than H264 level 3.0 - convert to a level <= 3.0 for best compatibility.");
+                      data["error"] = "Not optimal (details in log)";
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }else{
+          getMeta = true;
+        }
+        if (getMeta){
           char * tmp_cmd[3] = {0, 0, 0};
           std::string mistinfo = Util::getMyPath() + "MistInfo";
           tmp_cmd[0] = (char*)mistinfo.c_str();
@@ -77,30 +115,17 @@ namespace Controller {
           data.removeMember("meta");
         }
         if (Util::epoch() - lastBuffer[name] > 5){
-          data["error"] = "Available";
+          if ( !data.isMember("error")){
+            data["error"] = "Available";
+          }
           data["online"] = 2;
         }else{
           data["online"] = 1;
-          data.removeMember("error");
         }
         return; //MistPlayer handles VoD
-      }else{
-        cmd1 = "ffmpeg -re -async 2 -i " + URL + " -f flv -";
-        cmd2 = "MistFLV2DTSC";
       }
-      if (data.isMember("DVR") && data["DVR"].asInt() > 0){
-        data["DVR"] = data["DVR"].asInt();
-        cmd3 = "MistBuffer -t " + data["DVR"].asString() + " -s " + name;
-      }else{
-        cmd3 = "MistBuffer -s " + name;
-      }
-      if (cmd2 != ""){
-        Util::Procs::Start(name, cmd1, Util::getMyPath() + cmd2, Util::getMyPath() + cmd3);
-        Log("BUFF", "(re)starting stream buffer " + name + " for ffmpeg data: " + cmd1);
-      }else{
-        Util::Procs::Start(name, cmd1, Util::getMyPath() + cmd3);
-        Log("BUFF", "(re)starting stream buffer " + name + " using input file " + URL);
-      }
+      Util::Procs::Start(name, "ffmpeg -re -async 2 -i " + URL + " -f flv -", Util::getMyPath() + "MistFLV2DTSC", Util::getMyPath() + buffcmd);
+      Log("BUFF", "(re)starting stream buffer " + name + " for ffmpeg data: ffmpeg -re -async 2 -i " + URL + " -f flv -");
     }
   }
 
@@ -111,6 +136,9 @@ namespace Controller {
     for (JSON::ObjIter jit = data.ObjBegin(); jit != data.ObjEnd(); jit++){
       if ( !Util::Procs::isActive(jit->first)){
         startStream(jit->first, jit->second);
+      }
+      if (!jit->second.isMember("name")){
+        jit->second["name"] = jit->first;
       }
       if (currTime - lastBuffer[jit->first] > 5){
         if (jit->second.isMember("source") && jit->second["source"].asString().substr(0, 1) == "/" && jit->second.isMember("error")
@@ -171,22 +199,46 @@ namespace Controller {
     for (JSON::ObjIter jit = in.ObjBegin(); jit != in.ObjEnd(); jit++){
       if (out.isMember(jit->first)){
         if ( !streamsEqual(jit->second, out[jit->first])){
+          out[jit->first].null();
+          out[jit->first]["name"] = jit->first;
+          out[jit->first]["source"] = jit->second["source"];
+          out[jit->first]["DVR"] = jit->second["DVR"].asInt();
+          out[jit->first]["cut"] = jit->second["cut"].asInt();
+          out[jit->first]["updated"] = 1ll;
           Log("STRM", std::string("Updated stream ") + jit->first);
-          Util::Procs::Stop(jit->first);
-          startStream(jit->first, jit->second);
+          if (out[jit->first]["source"].asStringRef().substr(0, 7) != "push://"){
+            Util::Procs::Stop(jit->first);
+            startStream(jit->first, out[jit->first]);
+          }else{
+            if ( !Util::Procs::isActive(jit->first)){
+              startStream(jit->first, out[jit->first]);
+            }
+          }
         }
       }else{
+        out[jit->first]["name"] = jit->first;
+        out[jit->first]["source"] = jit->second["source"];
+        out[jit->first]["DVR"] = jit->second["DVR"].asInt();
+        out[jit->first]["cut"] = jit->second["cut"].asInt();
         Log("STRM", std::string("New stream ") + jit->first);
-        startStream(jit->first, jit->second);
+        startStream(jit->first, out[jit->first]);
       }
     }
 
     //check for deleted streams
+    std::set<std::string> toDelete;
     for (JSON::ObjIter jit = out.ObjBegin(); jit != out.ObjEnd(); jit++){
       if ( !in.isMember(jit->first)){
+        toDelete.insert(jit->first);
         Log("STRM", std::string("Deleted stream ") + jit->first);
         Util::Procs::Stop(jit->first);
       }
+    }
+    //actually delete the streams
+    while (toDelete.size() > 0){
+      std::string deleting = *(toDelete.begin());
+      out.removeMember(deleting);
+      toDelete.erase(deleting);
     }
 
     //update old-style configurations to new-style
@@ -202,7 +254,6 @@ namespace Controller {
       }
     }
 
-    out = in;
   }
 
 } //Controller namespace

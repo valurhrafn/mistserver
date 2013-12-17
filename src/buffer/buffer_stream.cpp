@@ -5,11 +5,11 @@
 #include <mist/timing.h>
 
 namespace Buffer {
-  ///\brief Stores the singleton reference.
+  /// Stores the singleton reference.
   Stream * Stream::ref = 0;
 
-  ///\brief Returns a reference to the singleton instance of this class.
-  ///\return A reference to the class.
+  /// Returns a reference to the singleton instance of this class.
+  /// \return A reference to the class.
   Stream * Stream::get(){
     static tthread::mutex creator;
     if (ref == 0){
@@ -17,20 +17,18 @@ namespace Buffer {
       creator.lock();
       if (ref == 0){
         ref = new Stream();
+        ref->metadata["tracks"] = 1ll;
+        ref->metadata["live"] = 1ll;
       }
       creator.unlock();
     }
     return ref;
   }
 
-  ///\brief Creates a new DTSC::Stream object, private function so only one instance can exist.
-  Stream::Stream(){
-    Strm = new DTSC::Stream(5);
-    readers = 0;
-    writers = 0;
-  }
+  /// Creates a new DTSC::Stream object, private function so only one instance can exist.
+  Stream::Stream() : DTSC::Stream(5){}
 
-  ///\brief Do cleanup on delete.
+  /// Do cleanup on delete.
   Stream::~Stream(){
     tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     if (users.size() > 0){
@@ -41,11 +39,10 @@ namespace Buffer {
       }
     }
     moreData.notify_all();
-    delete Strm;
   }
 
-  ///\brief Calculate and return the current statistics.
-  ///\return The current statistics in JSON format.
+  /// Calculate and return the current statistics.
+  /// \return The current statistics in JSON format.
   std::string & Stream::getStats(){
     static std::string ret;
     long long int now = Util::epoch();
@@ -64,11 +61,10 @@ namespace Buffer {
     Storage["totals"]["now"] = now;
     Storage["buffer"] = name;
 
-    Storage["meta"] = Strm->metadata;
+    Storage["meta"] = metadata;
 
     if(Storage["meta"].isMember("tracks") && Storage["meta"]["tracks"].size() > 0){
       for(JSON::ObjIter it = Storage["meta"]["tracks"].ObjBegin(); it != Storage["meta"]["tracks"].ObjEnd(); it++){
-        it->second.removeMember("init");
         it->second.removeMember("keys");
         it->second.removeMember("frags");
       }
@@ -80,63 +76,38 @@ namespace Buffer {
     return ret;
   }
 
-  ///\brief Get a new DTSC::Ring object for a user.
-  ///\return A new DTSC::Ring object.
-  DTSC::Ring * Stream::getRing(){
-    return Strm->getRing();
-  }
-
-  ///\brief Drop a DTSC::Ring object.
-  ///\param ring The DTSC::Ring to be invalidated.
-  void Stream::dropRing(DTSC::Ring * ring){
-    Strm->dropRing(ring);
-  }
-
-  ///\brief Get the (constant) header data of this stream.
-  ///\return A reference to the header data of the stream.
-  std::string & Stream::getHeader(){
-    return Strm->outHeader();
-  }
-
-  ///\brief Set the IP address to accept push data from.
-  ///\param ip The new IP to accept push data from.
+  /// Set the IP address to accept push data from.
+  /// \param ip The new IP to accept push data from.
   void Stream::setWaitingIP(std::string ip){
     waiting_ip = ip;
   }
 
   ///\brief Check if this is the IP address to accept push data from.
-  ///\param ip The IP address to check.
-  ///\return True if it is the correct address, false otherwise.
-  bool Stream::checkWaitingIP(std::string ip){
-    if (ip == waiting_ip || ip == "::ffff:" + waiting_ip){
-      return true;
+  ///\param ip The IP address to check, followed by a space and the password to check.
+  ///\return True if it is the correct address or password, false otherwise.
+  bool Stream::checkWaitingIP(std::string push_request){
+    std::string ip = push_request.substr(0, push_request.find(' '));
+    std::string pass = push_request.substr(push_request.find(' ') + 1);
+    if (waiting_ip.length() > 0 && waiting_ip[0] == '@'){
+      if (pass == waiting_ip.substr(1)){
+        return true;
+      }else{
+        std::cout << "Password '" << pass << "' incorrect" << std::endl;
+        return false;
+      }
     }else{
-      std::cout << ip << " != (::ffff:)" << waiting_ip << std::endl;
-      return false;
+      if (ip == waiting_ip || ip == "::ffff:" + waiting_ip){
+        return true;
+      }else{
+        std::cout << ip << " != (::ffff:)" << waiting_ip << std::endl;
+        return false;
+      }
     }
   }
 
-  ///\brief Sets the current socket for push data.
-  ///\param S The new socket for accepting push data.
-  ///\return True if succesful, false otherwise.
-  bool Stream::setInput(Socket::Connection S){
-    if (ip_input.connected()){
-      return false;
-    }else{
-      ip_input = S;
-      return true;
-    }
-  }
-
-  ///\brief Gets the current socket for push data.
-  ///\return A reference to the push socket.
-  Socket::Connection & Stream::getIPInput(){
-    return ip_input;
-  }
-
-  ///\brief Stores intermediate statistics.
-  ///\param username The name of the user.
-  ///\param stats The final statistics to store.
+  /// Stores intermediate statistics.
+  /// \param username The name of the user.
+  /// \param stats The final statistics to store.
   void Stream::saveStats(std::string username, Stats & stats){
     tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     Storage["curr"][username]["connector"] = stats.connector;
@@ -147,10 +118,10 @@ namespace Buffer {
     Storage["curr"][username]["start"] = Util::epoch() - stats.conntime;
   }
 
-  ///\brief Stores final statistics.
-  ///\param username The name of the user.
-  ///\param stats The final statistics to store.
-  ///\param reason The reason for disconnecting.
+  /// Stores final statistics.
+  /// \param username The name of the user.
+  /// \param stats The final statistics to store.
+  /// \param reason The reason for disconnecting.
   void Stream::clearStats(std::string username, Stats & stats, std::string reason){
     tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     if (Storage["curr"].isMember(username)){
@@ -167,91 +138,85 @@ namespace Buffer {
     Storage["log"][username]["host"] = stats.host;
     Storage["log"][username]["start"] = Util::epoch() - stats.conntime;
   }
-
-  ///\brief Ask to obtain a write lock.
-  ///
-  /// Blocks until writing is safe.
-  void Stream::getWriteLock(){
-    rw_mutex.lock();
-    writers++;
-    while (writers != 1 && readers != 0){
-      rw_change.wait(rw_mutex);
-    }
-    rw_mutex.unlock();
-  }
-
-  ///\brief Drops a previously obtained write lock.
-  ///\param newPacketsAvailable Whether new packets are available to update the index.
-  void Stream::dropWriteLock(bool newPacketsAvailable){
-    if (newPacketsAvailable){
-      Strm->metadata.netPrepare();
-    }
-    rw_mutex.lock();
-    writers--;
-    rw_mutex.unlock();
-    rw_change.notify_all();
-    if (newPacketsAvailable){
-      moreData.notify_all();
+  /// The deletion callback override that will disconnect users
+  /// whom are currently receiving a tag that is being deleted.
+  void Stream::deletionCallback(DTSC::livePos deleting){
+    tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
+    for (usersIt = users.begin(); usersIt != users.end(); usersIt++){
+      if ((*usersIt)->myRing->b == deleting){
+        (*usersIt)->Disconnect("Buffer underrun");
+      }
     }
   }
 
-  ///\brief Ask to obtain a read lock.
-  ///
-  ///Blocks until reading is safe.
-  void Stream::getReadLock(){
-    rw_mutex.lock();
-    while (writers > 0){
-      rw_change.wait(rw_mutex);
-    }
-    readers++;
-    rw_mutex.unlock();
-  }
-
-  ///\brief Drops a previously obtained read lock.
-  void Stream::dropReadLock(){
-    rw_mutex.lock();
-    readers--;
-    rw_mutex.unlock();
-    rw_change.notify_all();
-  }
-
-  ///\brief Retrieves a reference to the DTSC::Stream
-  ///\return A reference to the used DTSC::Stream
-  DTSC::Stream * Stream::getStream(){
-    return Strm;
-  }
-
-  ///\brief Sets the buffer name.
-  ///\param n The new name of the buffer.
+  /// Sets the buffer name.
+  /// \param n The new name of the buffer.
   void Stream::setName(std::string n){
     name = n;
   }
+  
+  /// parsePacket override that will lock the rw_mutex during parsing.
+  bool Stream::parsePacket(std::string & buffer){
+    rw_mutex.lock();
+    bool ret = DTSC::Stream::parsePacket(buffer);
+    rw_mutex.unlock();
+    if (ret){
+      rw_change.notify_all();
+      moreData.notify_all();
+    }
+    return ret;
+  }
+  
+  /// getNext override that will lock the rw_mutex during checking.
+  DTSC::livePos Stream::getNext(DTSC::livePos & pos, std::set<int> & allowedTracks){
+    tthread::lock_guard<tthread::mutex> guard(rw_mutex);
+    return DTSC::Stream::getNext(pos, allowedTracks);
+  }
+  
+  /// parsePacket override that will lock the rw_mutex during parsing.
+  bool Stream::parsePacket(Socket::Buffer & buffer){
+    bool ret = false;
+    rw_mutex.lock();
+    while (DTSC::Stream::parsePacket(buffer)){
+      //TODO: Update metadata with call erik will write
+      //metadata.netPrepare();
+      ret = true;
+    }
+    rw_mutex.unlock();
+    if (ret){
+      rw_change.notify_all();
+      moreData.notify_all();
+    }
+    return ret;
+  }
+  
+  /// Metadata sender that locks the rw_mutex during sending.
+  void Stream::sendMeta(Socket::Connection & s){
+    if (metadata){
+      rw_mutex.lock();
+      metadata.sendTo(s);
+      rw_mutex.unlock();
+    }
+  }
 
-  ///\brief Add a user to the userlist.
-  ///\param newUser The user to be added.
+  /// Add a user to the userlist.
+  /// \param newUser The user to be added.
   void Stream::addUser(user * newUser){
     tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     users.insert(newUser);
   }
 
-  ///\brief Removes a user to the userlist.
-  ///\param newUser The user to be removed.
+  /// Removes a user from the userlist.
+  /// \param newUser The user to be removed.
   void Stream::removeUser(user * oldUser){
     tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     users.erase(oldUser);
   }
 
-  ///\brief Disconnects all users.
-  void Stream::disconnectUsers(){
-    tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
-    for (usersIt = users.begin(); usersIt != users.end(); usersIt++){
-      (*usersIt)->Disconnect("Stream reset");
-    }
-  }
-  
-  ///\brief Blocks the thread until new data is available.
+  /// Blocks the thread until new data is available.
   void Stream::waitForData(){
     tthread::lock_guard<tthread::recursive_mutex> guard(stats_mutex);
     moreData.wait(stats_mutex);
   }
+  
 }

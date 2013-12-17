@@ -74,7 +74,7 @@ namespace Connector_HTTP {
                 "QualityLevels=\"" << allAudio.size() << "\" "
                 "Name=\"audio\" "
                 "Chunks=\"" << allAudio.ObjBegin()->second["keys"].size() << "\" "
-                "Url=\"Q({bitrate})/A({start time})\">\n";
+                "Url=\"Q({bitrate},{CustomAttributes})/A({start time})\">\n";
       int index = 0;
       for (JSON::ObjIter oIt = allAudio.ObjBegin(); oIt != allAudio.ObjEnd(); oIt++){
         Result << "<QualityLevel "
@@ -90,10 +90,14 @@ namespace Connector_HTTP {
                   "BitsPerSample=\"16\" "
                   "PacketSize=\"4\" "
                   "AudioTag=\"255\" "
-                  "FourCC=\"AACL\" />\n";
+                  "FourCC=\"AACL\" >\n";
+        Result << "<CustomAttributes>\n" 
+                  "<Attribute Name = \"TrackID\" Value = \"" << oIt->second["trackid"].asString() << "\" />" 
+                  "</CustomAttributes>";
+        Result << "</QualityLevel>\n";
         index++;
       }
-      for (JSON::ArrIter keyIt = allAudio.ObjBegin()->second["keys"].ArrBegin(); keyIt != allAudio.ObjBegin()->second["keys"].ArrEnd(); keyIt++){
+      for (JSON::ArrIter keyIt = allAudio.ObjBegin()->second["keys"].ArrBegin(); keyIt != ((allAudio.ObjBegin()->second["keys"].ArrEnd()) - 1); keyIt++){
         Result << "<c ";
         if (keyIt == allAudio.ObjBegin()->second["keys"].ArrBegin()){
           Result << "t=\"" << allAudio.ObjBegin()->second["firstms"].asInt() * 10000 << "\" ";
@@ -109,7 +113,7 @@ namespace Connector_HTTP {
                 "QualityLevels=\"" << allVideo.size() << "\" "
                 "Name=\"video\" "
                 "Chunks=\"" << allVideo.ObjBegin()->second["keys"].size() << "\" "
-                "Url=\"Q({bitrate})/V({start time})\" "
+                "Url=\"Q({bitrate},{CustomAttributes})/V({start time})\" "
                 "MaxWidth=\"" << maxWidth << "\" "
                 "MaxHeight=\"" << maxHeight << "\" "
                 "DisplayWidth=\"" << maxWidth << "\" "
@@ -130,13 +134,17 @@ namespace Connector_HTTP {
         Result << std::dec << "\" "
                   "MaxWidth=\"" << oIt->second["width"].asInt() << "\" "
                   "MaxHeight=\"" << oIt->second["height"].asInt() << "\" "
-                  "FourCC=\"AVC1\" />\n";
+                  "FourCC=\"AVC1\" >\n";
+        Result << "<CustomAttributes>\n" 
+                  "<Attribute Name = \"TrackID\" Value = \"" << oIt->second["trackid"].asString() << "\" />" 
+                  "</CustomAttributes>";
+        Result << "</QualityLevel>\n";
         index++;
       }
-      for (JSON::ArrIter keyIt = allVideo.ObjBegin()->second["keys"].ArrBegin(); keyIt != allVideo.ObjBegin()->second["keys"].ArrEnd(); keyIt++){
+      for (JSON::ArrIter keyIt = allVideo.ObjBegin()->second["keys"].ArrBegin(); keyIt != ((allVideo.ObjBegin()->second["keys"].ArrEnd()) - 1); keyIt++){
         Result << "<c ";
         if (keyIt == allVideo.ObjBegin()->second["keys"].ArrBegin()){
-          Result << "t=\"" << allVideo.ObjBegin()->second["firstms"].asInt() * 10000 << "\" ";
+          Result << "t=\"" << (*keyIt)["time"].asInt() * 10000 << "\" ";
         }
         Result << "d=\"" << (*keyIt)["len"].asInt() * 10000 << "\" />\n";
       }
@@ -228,7 +236,7 @@ namespace Connector_HTTP {
               if (HTTP_R.url.find("Manifest") == std::string::npos){
                 //We have a non-manifest request, parse it.
                 
-                Quality = HTTP_R.url.substr(HTTP_R.url.find("/Q(", 8) + 3);
+                Quality = HTTP_R.url.substr(HTTP_R.url.find("TrackID=", 8) + 8);
                 Quality = Quality.substr(0, Quality.find(")"));
                 parseString = HTTP_R.url.substr(HTTP_R.url.find(")/") + 2);
                 wantsAudio = false;
@@ -241,26 +249,9 @@ namespace Connector_HTTP {
                 }
                 parseString = parseString.substr(parseString.find("(") + 1);
                 requestedTime = atoll(parseString.substr(0, parseString.find(")")).c_str());
-                JSON::Value myRef;
-                long long int selectedQuality = atoll(Quality.c_str()) / 8;
-                if (wantsVideo){
-                  //Select the correct track ID
-                  for (JSON::ObjIter vIt = allVideo.ObjBegin(); vIt != allVideo.ObjEnd(); vIt++){
-                    if (vIt->second["bps"].asInt() == selectedQuality){
-                      myRef = vIt->second;
-                    }
-                  }
-                }
-                if (wantsAudio){
-                  //Select the correct track ID
-                  for (JSON::ObjIter aIt = allAudio.ObjBegin(); aIt != allAudio.ObjEnd(); aIt++){
-                    if (aIt->second["bps"].asInt() == selectedQuality){
-                      myRef = aIt->second;
-                    }
-                  }
-                }
+                long long int selectedQuality = atoll(Quality.c_str());
+                JSON::Value & myRef = Strm.getTrackById(selectedQuality);
                 if (Strm.metadata.isMember("live")){
-                  ///\todo Fix this for live stuff
                   int seekable = Strm.canSeekms(requestedTime / 10000);
                   if (seekable == 0){
                     // iff the fragment in question is available, check if the next is available too
@@ -325,17 +316,7 @@ namespace Connector_HTTP {
                   }
                 }
                 
-                
-                sstream << "t " << myRef["trackid"].asInt() << "\n";
-                sstream << "s " << (requestedTime / 10000) << "\n";
-                sstream << "o\n";
-
-                ss.SendNow(sstream.str().c_str());
-
-                unsigned int myDuration;
-                
-                //Wrap everything in mp4 boxes
-                MP4::MFHD mfhd_box;
+                //Obtain the corresponding track;
                 JSON::Value trackRef;
                 if (wantsVideo){
                   trackRef = allVideo.ObjBegin()->second;
@@ -348,26 +329,41 @@ namespace Connector_HTTP {
                 for (JSON::ArrIter keyIt = trackRef["keys"].ArrBegin(); keyIt != trackRef["keys"].ArrEnd(); keyIt++){
                   if ((*keyIt)["time"].asInt() >= (requestedTime / 10000)){
                     keyObj = (*keyIt);
-                    mfhd_box.setSequenceNumber((*keyIt)["num"].asInt());
-                    myDuration = (*keyIt)["len"].asInt() * 10000;
                     break;
                   }
                 }
                 
+                sstream << "t " << myRef["trackid"].asInt() << "\n";
+                sstream << "s " << keyObj["time"].asInt() << "\n";
+                sstream << "p " << keyObj["time"].asInt() + keyObj["len"].asInt() << "\n";
+//                sstream << "o\n";
+
+                ss.SendNow(sstream.str().c_str());
+                unsigned int myDuration;
+                
+                //Wrap everything in mp4 boxes
+                MP4::MFHD mfhd_box;
+                mfhd_box.setSequenceNumber(keyObj["num"].asInt());
+                myDuration = keyObj["len"].asInt() * 10000;
+                
                 MP4::TFHD tfhd_box;
                 tfhd_box.setFlags(MP4::tfhdSampleFlag);
                 tfhd_box.setTrackID(1);
-                tfhd_box.setDefaultSampleFlags(0x000000C0 | MP4::isKeySample);
+                //if (trackRef["type"].asString() == "video"){
+                  tfhd_box.setDefaultSampleFlags(0x000000C0 | MP4::noIPicture | MP4::noDisposable | MP4::noKeySample);
+                //}else{
+                //  tfhd_box.setDefaultSampleFlags(0x000000C0 | MP4::noKeySample);
+                //}
                 
                 MP4::TRUN trun_box;
                 trun_box.setDataOffset(42);
                 if (trackRef["type"].asString() == "video"){
                  trun_box.setFlags(MP4::trundataOffset | MP4::trunfirstSampleFlags | MP4::trunsampleDuration | MP4::trunsampleSize);
-                 trun_box.setFirstSampleFlags(0x00000040 | MP4::noKeySample);
                 }else{
                   trun_box.setFlags(MP4::trundataOffset | MP4::trunsampleDuration | MP4::trunsampleSize);
-                  trun_box.setFirstSampleFlags(0x00000040 | MP4::isKeySample);
+                //  trun_box.setFirstSampleFlags(0x00000040 | MP4::noKeySample);
                 }
+                trun_box.setFirstSampleFlags(0x00000040 | MP4::isIPicture | MP4::noDisposable | MP4::isKeySample);
                 std::deque<long long int> tmpParts;
                 JSON::decodeVector(keyObj["parts"].asString(), tmpParts);
                 for (int i = 0; i < tmpParts.size(); i++){
@@ -404,10 +400,10 @@ namespace Connector_HTTP {
                   fragref_box.setVersion(1);
                   fragref_box.setFragmentCount(0);
                   int fragCount = 0;
-                  for (int i = 0; i < Strm.metadata["keytime"].size(); i++){
-                    if (Strm.metadata["keytime"][i].asInt() > (requestedTime / 10000)){
-                      fragref_box.setTime(fragCount, Strm.metadata["keytime"][i].asInt() * 10000);
-                      fragref_box.setDuration(fragCount, Strm.metadata["keylen"][i].asInt() * 10000);
+                  for (int i = 0; i < 2 && i < trackRef["keys"].size() - 1; i++){//< trackRef["keys"].size() - 1; i++){
+                    if (trackRef["keys"][i]["time"].asInt() > (requestedTime / 10000)){
+                      fragref_box.setTime(fragCount, trackRef["keys"][i]["time"].asInt() * 10000);
+                      fragref_box.setDuration(fragCount, trackRef["keys"][i]["len"].asInt() * 10000);
                       fragref_box.setFragmentCount(++fragCount);
                     }
                   }
@@ -459,7 +455,7 @@ namespace Connector_HTTP {
           lastStats = now;
           ss.SendNow(conn.getStats("HTTP_Smooth").c_str());
         }
-        if (handlingRequest && ss.spool()){
+        if (/*handlingRequest &&*/ ss.spool()){
           while (Strm.parsePacket(ss.Received())){
             if (Strm.lastType() == DTSC::AUDIO || Strm.lastType() == DTSC::VIDEO){
               HTTP_S.Chunkify(Strm.lastData(), conn);
@@ -497,9 +493,11 @@ int main(int argc, char ** argv){
   capa["methods"][0u]["handler"] = "http";
   capa["methods"][0u]["type"] = "html5/application/vnd.ms-ss";
   capa["methods"][0u]["priority"] = 9ll;
+  capa["methods"][0u]["nolive"] = 1;
   capa["methods"][1u]["handler"] = "http";
   capa["methods"][1u]["type"] = "silverlight";
   capa["methods"][1u]["priority"] = 1ll;
+  capa["methods"][1u]["nolive"] = 1;
   conf.addBasicConnectorOptions(capa);
   conf.parseArgs(argc, argv);
   
